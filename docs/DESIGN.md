@@ -749,6 +749,19 @@ with controller".
   (the PS4 gives one process the GPU: no GPU process). A project of its own: `docs/WEBGPU.md` (pages have
   it from v00.40, below).
 
+**The final version, released (v1.00).** User: "release orbisweb to github", "do final version". v00.47 with:
+- **the hot-spot profiler off by default** (`profiler`, Settings → Diagnostics): it looks at every thread
+  through signals, a cost every user's console paid for a developer's question;
+- **UnRAR only on request** (`WISP_WITH_UNRAR=1` for `app/build.sh`; `package.sh` adds its license text only
+  then): the UI program links aria2 (GPL 2 or later) and Vita3K's canvas (GPL 2 or later), and UnRAR's license
+  forbids what the GPL requires, so packages given to others leave it out; libarchive reads RAR (not encrypted);
+- **About's "Built on"** lists Dawn, the ad-block lists and OrbisWeb's own license and source, and UnRAR only
+  when it is built in.
+
+The repository (github.com/iHaiDeeZ/OrbisWeb, GPL 2 or later) holds the app, the scripts, the patches, the art
+and these notes; console logs, packages and promo videos stay out. `patches/ps4-kit` carries only OrbisWeb's own
+kit changes, on the kit commit named in `patches/ps4-kit/BASE`.
+
 **One GPU device for the process, and where GPU memory goes (v00.47).** The end of v00.44's long Star Fox 64
 session (`logs/v45-137/web.prev.log`, 33 MB): ~170 s into the game the direct memory ran out in 2 MiB allocations
 in every heap (Zink's slabs: buffers and images up to 1 MiB are carved out of 2 MiB ones); the page slowed to
