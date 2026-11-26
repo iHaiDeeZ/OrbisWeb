@@ -1,0 +1,124 @@
+From 6ed0025a5db62c1f22a4ec0d626e14dd2c24ce30 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Tue, 24 Nov 2026 21:03:23 +0300
+Subject: [PATCH] PS4 (Wisp): the PS4 as a platform: POSIX, Vulkan from the
+ kit's RADV (no libvulkan to load), no executable path
+
+---
+ src/dawn/common/SystemUtils.cpp            |  4 ++--
+ src/dawn/native/vulkan/BackendVk.cpp       |  5 +++++
+ src/dawn/native/vulkan/VulkanFunctions.cpp | 14 ++++++++++++++
+ src/utils/platform.h                       |  9 +++++++++
+ 4 files changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/src/dawn/common/SystemUtils.cpp b/src/dawn/common/SystemUtils.cpp
+index 79b728d3d..f95e07517 100644
+--- a/src/dawn/common/SystemUtils.cpp
++++ b/src/dawn/common/SystemUtils.cpp
+@@ -144,7 +144,7 @@ std::optional<std::string> GetExecutablePath() {
+     buffer[size] = '\0';
+     return buffer.data();
+ }
+-#elif DAWN_PLATFORM_IS(FUCHSIA)
++#elif DAWN_PLATFORM_IS(FUCHSIA) || DAWN_PLATFORM_IS(PS4)  // (PS4, Wisp: no path to tell)
+ std::optional<std::string> GetExecutablePath() {
+     // UNIMPLEMENTED
+     return {};
+@@ -199,7 +199,7 @@ std::optional<std::string> GetModulePath() {
+     return GetHModulePath(module);
+ #endif
+ }
+-#elif DAWN_PLATFORM_IS(FUCHSIA)
++#elif DAWN_PLATFORM_IS(FUCHSIA) || DAWN_PLATFORM_IS(PS4)  // (PS4, Wisp: no path to tell)
+ std::optional<std::string> GetModulePath() {
+     return {};
+ }
+diff --git a/src/dawn/native/vulkan/BackendVk.cpp b/src/dawn/native/vulkan/BackendVk.cpp
+index f55dc878f..a2cd55dca 100644
+--- a/src/dawn/native/vulkan/BackendVk.cpp
++++ b/src/dawn/native/vulkan/BackendVk.cpp
+@@ -69,6 +69,9 @@ constexpr char kVulkanLibName[] = "vulkan-1.dll";
+ constexpr char kVulkanLibName[] = "libvulkan.dylib";
+ #elif DAWN_PLATFORM_IS(FUCHSIA)
+ constexpr char kVulkanLibName[] = "libvulkan.so";
++#elif DAWN_PLATFORM_IS(PS4)
++// (none to load: VulkanFunctions::LoadGlobalProcs takes the kit's RADV, linked into the process)
++constexpr char kVulkanLibName[] = "";
+ #else
+ #error "Unimplemented Vulkan backend platform"
+ #endif
+@@ -323,7 +326,9 @@ MaybeError VulkanInstance::Initialize(const InstanceBase* instance, ICD icd) {
+ 
+     switch (icd) {
+         case ICD::None: {
++#if !DAWN_PLATFORM_IS(PS4)
+             DAWN_TRY(LoadVulkan(kVulkanLibName));
++#endif
+             // Succesfully loaded driver; break.
+             break;
+         }
+diff --git a/src/dawn/native/vulkan/VulkanFunctions.cpp b/src/dawn/native/vulkan/VulkanFunctions.cpp
+index 1406c7633..3552ec4fd 100644
+--- a/src/dawn/native/vulkan/VulkanFunctions.cpp
++++ b/src/dawn/native/vulkan/VulkanFunctions.cpp
+@@ -33,6 +33,11 @@
+ #include "src/dawn/common/DynamicLib.h"
+ #include "src/dawn/native/vulkan/VulkanInfo.h"
+ 
++#if DAWN_PLATFORM_IS(PS4)
++// The kit's RADV (ps4-kit/gpu/ps4_vk_wsi.cpp): its vkGetInstanceProcAddr, as Zink takes it
++extern "C" void* ps4kit_vk_get_instance_proc_addr(void);
++#endif
++
+ namespace dawn::native::vulkan {
+ 
+ namespace {
+@@ -89,9 +94,18 @@ F AsVkFn(void(VKAPI_PTR* addr)()) {
+     } while (0)
+ 
+ MaybeError VulkanFunctions::LoadGlobalProcs(const DynamicLib& vulkanLib) {
++#if DAWN_PLATFORM_IS(PS4)
++    (void)vulkanLib;
++    GetInstanceProcAddr =
++        reinterpret_cast<PFN_vkGetInstanceProcAddr>(ps4kit_vk_get_instance_proc_addr());
++    if (GetInstanceProcAddr == nullptr) {
++        return DAWN_UNRECOVERABLE_ERROR("Couldn't get vkGetInstanceProcAddr from the PS4 kit");
++    }
++#else
+     if (!vulkanLib.GetProc(&GetInstanceProcAddr, "vkGetInstanceProcAddr")) {
+         return DAWN_UNRECOVERABLE_ERROR("Couldn't get vkGetInstanceProcAddr");
+     }
++#endif
+ 
+     GET_GLOBAL_PROC(CreateInstance);
+     GET_GLOBAL_PROC(EnumerateInstanceExtensionProperties);
+diff --git a/src/utils/platform.h b/src/utils/platform.h
+index 4dd58a487..31b73724c 100644
+--- a/src/utils/platform.h
++++ b/src/utils/platform.h
+@@ -95,6 +95,12 @@
+ #define DAWN_PLATFORM_IS_POSIX 1
+ #include <emscripten/emscripten.h>
+ 
++#elif defined(__ORBIS__)
++// PS4 (Wisp, OpenOrbis): a FreeBSD kernel with Sony's libraries, everything linked statically; Vulkan
++// is the kit's RADV in the process (no libvulkan to load, no DMA-BUF or sync files)
++#define DAWN_PLATFORM_IS_PS4 1
++#define DAWN_PLATFORM_IS_POSIX 1
++
+ #else
+ #error "Unsupported platform."
+ #endif
+@@ -241,6 +247,9 @@ static_assert(sizeof(sizeof(char)) == 4, "Expect sizeof(size_t) == 4");
+ #if !defined(DAWN_PLATFORM_IS_EMSCRIPTEN)
+ #define DAWN_PLATFORM_IS_EMSCRIPTEN 0
+ #endif
++#if !defined(DAWN_PLATFORM_IS_PS4)
++#define DAWN_PLATFORM_IS_PS4 0
++#endif
+ 
+ #if !defined(DAWN_PLATFORM_IS_X86)
+ #define DAWN_PLATFORM_IS_X86 0
+-- 
+2.53.0
+

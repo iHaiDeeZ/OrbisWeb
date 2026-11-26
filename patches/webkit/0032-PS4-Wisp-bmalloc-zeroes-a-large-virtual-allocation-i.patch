@@ -1,0 +1,49 @@
+From 8e4d67b8637a2f49f7aecfcea705002a2c7a6662 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Tue, 24 Nov 2026 21:40:16 +0300
+Subject: [PATCH] PS4 (Wisp): bmalloc zeroes a large virtual allocation in
+ place
+
+tryLargeZeroedMemalignVirtual zeroes what it allocated with vmZeroAndPurge, which maps anonymous
+memory MAP_FIXED over it. On the PS4 the memory came from the kit's mmap, direct memory, and the kernel
+refuses that mapping: the RELEASE_BASSERT after it stopped the web process (fault address 0xbbadbeef)
+when a game created its WebAssembly.Memory (JSC::Wasm::Memory::tryCreate). Zeroed with memset there
+instead; the kernel does not clear direct memory either.
+---
+ Source/bmalloc/bmalloc/bmalloc.cpp | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/Source/bmalloc/bmalloc/bmalloc.cpp b/Source/bmalloc/bmalloc/bmalloc.cpp
+index 6b5f3b6e..c419f193 100644
+--- a/Source/bmalloc/bmalloc/bmalloc.cpp
++++ b/Source/bmalloc/bmalloc/bmalloc.cpp
+@@ -29,6 +29,7 @@
+ #include "ProcessCheck.h"
+ #include "SystemHeap.h"
+ #include "VMAllocate.h"
++#include <string.h>
+ 
+ #if BENABLE(LIBPAS)
+ #include "bmalloc_heap_config.h"
+@@ -85,8 +86,17 @@ void* tryLargeZeroedMemalignVirtual(size_t requiredAlignment, size_t requestedSi
+     else
+         result = tryMemalign(alignment, size, mode, kind);
+ 
+-    if (result)
++    if (result) {
++#if defined(__ORBIS__)
++        // (PS4, Wisp) The memory came from the kit's mmap, direct memory, and vmZeroAndPurge maps
++        // anonymous memory MAP_FIXED over it to zero it: the PS4 refuses that mapping, and the
++        // RELEASE_BASSERT after it stopped the web process (0xbbadbeef) on a WebAssembly.Memory a game
++        // asked for. Zeroed in place instead (the kernel does not clear direct memory either).
++        memset(result, 0, size);
++#else
+         vmZeroAndPurge(result, size);
++#endif
++    }
+ 
+     return result;
+ }
+-- 
+2.53.0
+

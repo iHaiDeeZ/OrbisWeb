@@ -1,0 +1,165 @@
+From 94bf8057bd5fbb8dc666455c49798618aae4a88f Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Thu, 19 Nov 2026 19:46:36 +0300
+Subject: [PATCH 14/14] PS4 (Wisp): CPU frames recorded once and played back in
+ strips on painting threads (WISP_PAINT_STRIPS)
+
+---
+ .../NonCompositedFrameRenderer.cpp            | 127 +++++++++++++++++-
+ 1 file changed, 126 insertions(+), 1 deletion(-)
+
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
+index 112d7a34..fc8508ac 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
+@@ -41,6 +41,22 @@
+ #include <wtf/SetForScope.h>
+ #include <wtf/SystemTracing.h>
+ 
++#if defined(__ORBIS__)
++#include <WebCore/GraphicsContextSkia.h>
++#include <wtf/Condition.h>
++#include <wtf/Lock.h>
++#include <wtf/WorkerPool.h>
++#include <wtf/text/StringToIntegerConversion.h>
++WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
++#include <skia/core/SkBBHFactory.h>
++#include <skia/core/SkCanvas.h>
++#include <skia/core/SkPicture.h>
++#include <skia/core/SkPictureRecorder.h>
++#include <skia/core/SkPixmap.h>
++#include <skia/core/SkSurface.h>
++WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
++#endif
++
+ namespace WebKit {
+ using namespace WebCore;
+ 
+@@ -177,6 +193,98 @@ bool NonCompositedFrameRenderer::canUpdateRendering() const
+     return !m_pendingNotifyFrame;
+ }
+ 
++#if defined(__ORBIS__)
++// PS4 (Wisp): CPU rendering paints each frame on the web process's main thread, one 1.6 GHz Jaguar
++// core, while the app has six more. The frame is recorded once instead (an SkPicture, as WebKit's
++// composited CPU path records its tiles) and played back into the buffer in horizontal strips, the
++// first on this thread and the others on painting threads. WISP_PAINT_STRIPS: how many (default 4;
++// 1 paints as before).
++static unsigned wispPaintStrips()
++{
++    static unsigned strips = [] {
++        unsigned value = 4;
++        if (const char* env = getenv("WISP_PAINT_STRIPS")) {
++            auto parsed = parseInteger<unsigned>(StringView::fromLatin1(env));
++            if (parsed && *parsed >= 1 && *parsed <= 8)
++                value = *parsed;
++        }
++        return value;
++    }();
++    return strips;
++}
++
++// rects: the area to paint, in the buffer's pixels; false when the frame should be painted directly
++static bool wispPaintInStrips(SkCanvas& canvas, WebPage& webPage, const Vector<IntRect>& rects)
++{
++    unsigned strips = wispPaintStrips();
++    if (strips < 2)
++        return false;
++    SkPixmap pixmap;
++    if (!canvas.peekPixels(&pixmap) || !canvas.getTotalMatrix().isIdentity())
++        return false;
++    IntRect bounds;
++    for (const auto& rect : rects)
++        bounds.unite(rect);
++    bounds.intersect(IntRect(0, 0, pixmap.width(), pixmap.height()));
++    if (bounds.isEmpty())
++        return false;
++    // under ~120 rows a strip the threads cost more than they save
++    strips = std::min<unsigned>(strips, std::max(1, bounds.height() / 120));
++    if (strips < 2)
++        return false;
++
++    const float scale = webPage.deviceScaleFactor();
++    SkPictureRecorder recorder;
++    SkRTreeFactory rtreeFactory;
++    auto* recordingCanvas = recorder.beginRecording(pixmap.width(), pixmap.height(), &rtreeFactory);
++    {
++        GraphicsContextSkia recordingContext(*recordingCanvas, RenderingMode::Unaccelerated, RenderingPurpose::DOM);
++        recordingContext.beginRecording(GraphicsContextSkia::RecordingMode::Tile);
++        recordingContext.applyDeviceScaleFactor(scale);
++        for (auto rect : rects) {
++            rect.scale(1 / scale);
++            webPage.drawRect(recordingContext, rect);
++        }
++        recordingContext.endRecording();
++    }
++    sk_sp<SkPicture> picture = recorder.finishRecordingAsPicture();
++    if (!picture)
++        return false;
++
++    // the buffer is written below through canvases of its own: a snapshot of it must not see that
++    if (auto* surface = canvas.getSurface())
++        surface->notifyContentWillChange(SkSurface::kRetain_ContentChangeMode);
++
++    auto paintStrip = [&](unsigned index) {
++        const int top = bounds.y() + bounds.height() * static_cast<int>(index) / static_cast<int>(strips);
++        const int bottom = bounds.y() + bounds.height() * static_cast<int>(index + 1) / static_cast<int>(strips);
++        auto stripCanvas = SkCanvas::MakeRasterDirect(pixmap.info().makeWH(pixmap.width(), bottom - top), pixmap.writable_addr(0, top), pixmap.rowBytes());
++        if (!stripCanvas)
++            return;
++        stripCanvas->translate(0, -top);
++        stripCanvas->clipRect(SkRect::MakeLTRB(bounds.x(), top, bounds.maxX(), bottom));
++        picture->playback(stripCanvas.get());
++    };
++
++    static WorkerPool& workers = WorkerPool::create("WispPaint"_s, 7).leakRef();
++    Lock lock;
++    Condition condition;
++    unsigned remaining = strips - 1;
++    for (unsigned index = 1; index < strips; index++) {
++        workers.postTask([&, index] {
++            paintStrip(index);
++            Locker locker { lock };
++            if (!--remaining)
++                condition.notifyOne();
++        });
++    }
++    paintStrip(0);
++    Locker locker { lock };
++    condition.wait(lock, [&] { return !remaining; });
++    return true;
++}
++#endif
++
+ void NonCompositedFrameRenderer::updateRendering()
+ {
+     invalidateRenderingUpdateRunLoopObserver();
+@@ -246,7 +354,24 @@ void NonCompositedFrameRenderer::updateRendering()
+             WTFEndSignpost(canvas, DrawRect);
+         };
+ 
+-#if ENABLE(DAMAGE_TRACKING)
++#if defined(__ORBIS__) && ENABLE(DAMAGE_TRACKING)
++        // PS4 (Wisp): on the CPU, in strips on painting threads (wispPaintInStrips)
++        Vector<IntRect> wispRects;
++        if (auto& renderTargetDamage = m_surface->renderTargetDamage()) {
++            for (const auto& rect : *renderTargetDamage)
++                wispRects.append(rect);
++        } else {
++            auto all = webPage->bounds();
++            all.scale(webPage->deviceScaleFactor());
++            wispRects.append(all);
++        }
++        if (m_context || !wispPaintInStrips(*canvas, webPage.get(), wispRects)) {
++            for (auto rect : wispRects) {
++                rect.scale(1 / webPage->deviceScaleFactor());
++                drawRect(rect);
++            }
++        }
++#elif ENABLE(DAMAGE_TRACKING)
+         if (auto& renderTargetDamage = m_surface->renderTargetDamage()) {
+             for (const auto& rect : *renderTargetDamage) {
+                 auto scaledRect = rect;
+-- 
+2.53.0
+

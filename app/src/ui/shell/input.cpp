@@ -1,0 +1,288 @@
+// WinePS4's input (input.h). The pointer moves with the left stick (faster the further it is
+// pushed), the touch pad (like a laptop's) and a USB mouse. libSceMouse is linked, but its module
+// is loaded by the desktop (system module 0xa9, as shadPS4 lists it): a call into a system library
+// whose module isn't loaded ends the app (ps4-kit's ps4_modules.cpp), so the mouse is only used
+// once it is.
+#include "input.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+
+#include <orbis/Pad.h>
+#include <orbis/UserService.h>
+#include <orbis/libkernel.h>
+
+#include "screen.h"
+
+extern "C" {
+void ps4_boot_trace(const char *line);
+int32_t sceSysmoduleLoadModule(uint16_t id);
+}
+
+namespace shell {
+namespace {
+
+// libSceMouse (from shadPS4's description of it): one merged mouse for the user
+struct MouseOpenParam {
+    uint8_t behavior_flag;  // 1: every mouse as one
+    uint8_t reserved[7];
+};
+struct MouseData {
+    uint64_t timestamp;
+    bool connected;
+    uint32_t buttons;  // 1 left, 2 right, 4 middle, 8 and 16 the side buttons (back, forward)
+    int32_t x, y;      // movement since the last read
+    int32_t wheel;
+    int32_t tilt;      // the wheel's sideways tilt (horizontal scrolling)
+    uint8_t reserved[8];
+};
+static_assert(sizeof(MouseData) == 40, "libSceMouse's data");
+
+constexpr uint16_t MOUSE_MODULE = 0xa9;
+extern "C" {
+int32_t sceMouseInit();
+int32_t sceMouseOpen(int32_t user, int32_t type, int32_t index, const MouseOpenParam *param);
+int32_t sceMouseRead(int32_t handle, MouseData *data, int32_t count);
+}
+bool mouse_loaded = false;
+
+Input state;
+int32_t user = -1;
+int pad = -1;
+int mouse = -1;
+bool mouse_connected = false;   // as the mouse's last data said (it sends nothing while it lies still)
+uint32_t last_pad_buttons = 0;
+uint32_t last_mouse_buttons = 0;
+float repeat_wait = 0;
+bool finger = false;
+float finger_x = 0, finger_y = 0;
+float pointer_gain = 1.6f;  // the mouse's counts to pixels (Settings: speed 10 of 20)
+PadState pad_state;         // the controller as read last (input_pad)
+bool pad_ui = true;         // the controller drives the pointer and Input's buttons (input_pad_to_ui)
+
+void trace(const char *what, int value) {
+    char line[128];
+    std::snprintf(line, sizeof line, "input: %s (%08x)", what, static_cast<unsigned>(value));
+    std::fprintf(stderr, "shell: %s\n", line);
+    ps4_boot_trace(line);
+}
+
+void load_mouse() {
+    const int loaded = sceSysmoduleLoadModule(MOUSE_MODULE);
+    if (loaded != 0) {
+        trace("the mouse module did not load", loaded);
+        return;
+    }
+    const int init = sceMouseInit();
+    trace("mouse module loaded, sceMouseInit", init);
+    mouse_loaded = true;
+}
+
+void open_devices() {
+    if (user < 0) {
+        int32_t initial = -1;
+        if (sceUserServiceGetInitialUser(&initial) == 0)
+            user = initial;
+    }
+    if (user < 0)
+        return;
+    if (pad < 0) {
+        pad = scePadOpen(user, 0, 0, nullptr);
+        if (pad < 0)
+            pad = -1;
+    }
+    if (mouse < 0 && mouse_loaded) {
+        static int last_error = 0;
+        const MouseOpenParam param = {1, {}};  // every mouse as one
+        const int handle = sceMouseOpen(user, 0, 0, &param);
+        if (handle >= 0) {
+            mouse = handle;
+            trace("mouse opened", handle);
+        } else if (handle != last_error) {
+            last_error = handle;  // (once per answer: this is tried every second)
+            trace("sceMouseOpen failed", handle);
+        }
+    }
+}
+
+// a stick's position as -1..1, with a dead zone
+float axis(uint8_t value) {
+    const float v = (static_cast<float>(value) - 128.f) / 127.f;
+    if (std::fabs(v) < 0.14f)
+        return 0.f;
+    return std::clamp((v - std::copysign(0.14f, v)) / 0.86f, -1.f, 1.f);
+}
+
+} // namespace
+
+void input_warp(float x, float y) {
+    state.x = std::clamp(x, 0.f, static_cast<float>(SCREEN_W - 1));
+    state.y = std::clamp(y, 0.f, static_cast<float>(SCREEN_H - 1));
+    state.moved = true;
+}
+
+void input_set_pointer_speed(int speed) {
+    pointer_gain = std::clamp(speed, 1, 20) * 0.16f;
+}
+
+const PadState &input_pad() { return pad_state; }
+
+void input_pad_vibrate(uint8_t large, uint8_t small) {
+    if (pad < 0)
+        return;
+    const OrbisPadVibeParam param = {large, small};
+    scePadSetVibration(pad, &param);
+}
+
+void input_pad_to_ui(bool on) {
+    pad_ui = on;
+    finger = false;  // (the touch pad's next touch starts a move afresh)
+}
+
+void input_open() {
+    sceUserServiceInitialize(nullptr);
+    scePadInit();
+    load_mouse();
+    open_devices();
+}
+
+const Input &input_poll(float dt) {
+    static float reopen = 0;
+    if ((pad < 0 || (mouse < 0 && mouse_loaded)) && (reopen -= dt) <= 0) {
+        open_devices();
+        reopen = 1.f;  // a controller or mouse connected later
+    }
+    uint32_t held = 0;
+    float dx = 0, dy = 0;
+    state.scroll = 0;
+    state.scroll_x = 0;
+    state.pad = false;
+
+    OrbisPadData data{};
+    const bool pad_read = pad >= 0 && scePadReadState(pad, &data) == 0 && data.connected;
+    pad_state = PadState{};
+    if (pad_read) {
+        pad_state.connected = true;
+        pad_state.buttons = data.buttons;
+        pad_state.lx = data.leftStick.x;
+        pad_state.ly = data.leftStick.y;
+        pad_state.rx = data.rightStick.x;
+        pad_state.ry = data.rightStick.y;
+        pad_state.l2 = data.analogButtons.l2;
+        pad_state.r2 = data.analogButtons.r2;
+    }
+    if (pad_read && !pad_ui) {
+        state.pad = true;   // (a page has it: the pointer and Input's buttons are the mouse's alone)
+        last_pad_buttons = 0;
+        finger = false;
+    } else if (pad_read) {
+        state.pad = true;
+        const uint32_t b = data.buttons;
+        if (b & (ORBIS_PAD_BUTTON_CROSS | ORBIS_PAD_BUTTON_R2)) held |= BTN_CLICK;
+        if (b & ORBIS_PAD_BUTTON_SQUARE) held |= BTN_MENU;
+        if (b & ORBIS_PAD_BUTTON_CIRCLE) held |= BTN_BACK;
+        if (b & ORBIS_PAD_BUTTON_OPTIONS) held |= BTN_START;
+        if (b & ORBIS_PAD_BUTTON_TRIANGLE) held |= BTN_SWITCH;
+        if (b & ORBIS_PAD_BUTTON_L1) held |= BTN_PREV;
+        if (b & ORBIS_PAD_BUTTON_R1) held |= BTN_NEXT;
+        if (b & ORBIS_PAD_BUTTON_UP) held |= BTN_UP;
+        if (b & ORBIS_PAD_BUTTON_DOWN) held |= BTN_DOWN;
+        if (b & ORBIS_PAD_BUTTON_LEFT) held |= BTN_LEFT;
+        if (b & ORBIS_PAD_BUTTON_RIGHT) held |= BTN_RIGHT;
+        last_pad_buttons = b;
+
+        // left stick: up to ~1500 px/s, gently near the middle for aiming at small things
+        const float sx = axis(data.leftStick.x), sy = axis(data.leftStick.y);
+        const float speed = 1500.f * dt;
+        dx += sx * std::fabs(sx) * speed;
+        dy += sy * std::fabs(sy) * speed;
+        // right stick: scrolling, up to ~25 lines/s
+        const float ry = axis(data.rightStick.y);
+        state.scroll += ry * std::fabs(ry) * 25.f * dt;
+
+        // the touch pad as a laptop's: the finger's movement moves the pointer
+        if (data.touch.fingers > 0) {
+            const float fx = data.touch.touch[0].x, fy = data.touch.touch[0].y;
+            if (finger) {
+                dx += (fx - finger_x) * 1.1f;
+                dy += (fy - finger_y) * 1.1f;
+            }
+            finger = true;
+            finger_x = fx;
+            finger_y = fy;
+        } else {
+            finger = false;
+        }
+    }
+
+    if (mouse >= 0) {
+        MouseData events[8];
+        const int n = sceMouseRead(mouse, events, 8);
+        static int last_error = 0;
+        if (n < 0 && n != last_error) {
+            last_error = n;
+            trace("sceMouseRead failed", n);
+        }
+        if (n < 0) {
+            mouse_connected = false;
+            last_mouse_buttons = 0;
+        }
+        float mx = 0, my = 0;
+        uint32_t seen = 0;   // every button down in this read: a quick click (down and up in one read) counts
+        for (int i = 0; i < n; i++) {
+            if (!events[i].connected) {
+                mouse_connected = false;
+                last_mouse_buttons = 0;
+                continue;
+            }
+            mouse_connected = true;
+            mx += events[i].x;
+            my += events[i].y;
+            state.scroll -= events[i].wheel * 3.f;
+            state.scroll_x += events[i].tilt * 3.f;
+            last_mouse_buttons = events[i].buttons;
+            seen |= events[i].buttons;
+        }
+        // faster than its counts (1:1 across a 1080p screen was slow), and more for a quick move, as
+        // Windows' "enhance pointer precision": up to 1.9 times for 24 counts a frame and more
+        const float accel = 1.f + std::min(std::sqrt(mx * mx + my * my) / 24.f, 1.f) * 0.9f;
+        dx += mx * pointer_gain * accel;
+        dy += my * pointer_gain * accel;
+        // the buttons stay held between reads: a mouse lying still with a button down sends nothing
+        if (mouse_connected) {
+            const uint32_t buttons = last_mouse_buttons | seen;
+            if (buttons & 1) held |= BTN_CLICK;
+            if (buttons & 2) held |= BTN_MENU | BTN_MOUSE_RIGHT;
+            if (buttons & 4) held |= BTN_MOUSE_MIDDLE;
+            if (buttons & 8) held |= BTN_MOUSE_BACK;
+            if (buttons & 16) held |= BTN_MOUSE_FORWARD;
+        }
+    }
+    state.mouse = mouse_connected;
+
+    const float nx = std::clamp(state.x + dx, 0.f, static_cast<float>(SCREEN_W - 1));
+    const float ny = std::clamp(state.y + dy, 0.f, static_cast<float>(SCREEN_H - 1));
+    state.moved = nx != state.x || ny != state.y;
+    state.x = nx;
+    state.y = ny;
+
+    state.pressed = held & ~state.held;
+    state.released = state.held & ~held;
+    // the D-pad again while it's held: 0.4 s, then 12 a second
+    constexpr uint32_t REPEATS = BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT;
+    state.repeat = state.pressed & REPEATS;
+    if (held & REPEATS) {
+        if (state.pressed & REPEATS)
+            repeat_wait = 0.4f;
+        else if ((repeat_wait -= dt) <= 0) {
+            state.repeat = held & REPEATS;
+            repeat_wait = 1.f / 12.f;
+        }
+    }
+    state.held = held;
+    return state;
+}
+
+} // namespace shell

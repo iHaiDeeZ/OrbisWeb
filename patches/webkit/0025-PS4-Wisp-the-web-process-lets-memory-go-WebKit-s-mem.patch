@@ -1,0 +1,88 @@
+From c3ba63b1692fc61eb5d098d526baca8af007b7f5 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Fri, 20 Nov 2026 20:39:20 +0300
+Subject: [PATCH] PS4 (Wisp): the web process lets memory go: WebKit's memory
+ monitor runs, and a page that leaves gets its caches released and a full
+ collection
+
+WebKit started its periodic memory monitor only with its own malloc; this build uses the system one (the kit's heap, whose use wtf/ps4/MemoryPS4.cpp reports), so nothing ever let caches go or collected garbage as the heap grew, and closed tabs' memory stayed. The monitor now runs on the PS4 (the app sets its thresholds), and a page leaving the process (a tab closed or put to sleep) is followed by a non-critical release and a full collection (WISP_MEMORY_RELEASE=0 turns that off).
+---
+ Source/WebKit/WebProcess/WebProcess.cpp | 41 ++++++++++++++++++++++++-
+ 1 file changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/Source/WebKit/WebProcess/WebProcess.cpp b/Source/WebKit/WebProcess/WebProcess.cpp
+index 928a01e0..f283716e 100644
+--- a/Source/WebKit/WebProcess/WebProcess.cpp
++++ b/Source/WebKit/WebProcess/WebProcess.cpp
+@@ -159,6 +159,9 @@
+ #include <wtf/Language.h>
+ #include <wtf/ProcessPrivilege.h>
+ #include <wtf/RunLoop.h>
++#if defined(__ORBIS__)
++#include <wtf/MemoryFootprint.h>
++#endif
+ #include <wtf/RuntimeApplicationChecks.h>
+ #include <wtf/SystemTracing.h>
+ #include <wtf/TZoneMallocInlines.h>
+@@ -538,7 +541,13 @@ void WebProcess::initializeWebProcess(WebProcessCreationParameters&& parameters,
+ #if ENABLE(PERIODIC_MEMORY_MONITOR)
+         if (auto pollInterval = parameters.memoryFootprintPollIntervalForTesting)
+             memoryPressureHandler.setMemoryFootprintPollIntervalForTesting(pollInterval);
+-#if !USE(SYSTEM_MALLOC)
++#if defined(__ORBIS__)
++        // PS4 (Wisp): the system malloc here is the kit's heap, whose use WebKit reads (wtf/ps4/MemoryPS4.cpp). Without
++        // the monitor nothing told WebKit to let its caches go or to collect garbage as the heap grew, and the memory of
++        // closed tabs stayed. The app sets the thresholds (WebKitMemoryPressureSettings) and a kill threshold that is
++        // never reached: all tabs share this process.
++        memoryPressureHandler.setShouldUsePeriodicMemoryMonitor(true);
++#elif !USE(SYSTEM_MALLOC)
+         // If we're running with FastMalloc disabled, some kind of testing or debugging is probably happening.
+         // Let's be nice and not enable the memory kill mechanism.
+         memoryPressureHandler.setShouldUsePeriodicMemoryMonitor(isFastMallocEnabled() || JSC::Options::enableStrongRefTracker() || JSC::Options::dumpHeapOnLowMemory());
+@@ -1091,6 +1100,33 @@ Awaitable<unsigned> WebProcess::countWebPagesForTesting()
+     co_return m_pageMap.size();
+ }
+ 
++#if defined(__ORBIS__)
++// PS4 (Wisp): every tab's page lives in this one process. A page that goes (its tab closed, or put to sleep by the app)
++// leaves its documents, its scripts' objects and the resources only it used until JSC's next full collection, which a
++// large heap puts off for long (WindowProxy's "collect soon" only hastens JSC's own timer). A moment after (once for
++// several pages going together): the caches let go of what no page uses, and a full collection on the next turn of the
++// run loop. The app turns it off with WISP_MEMORY_RELEASE=0 (setting memory_release).
++static void wispReleaseMemoryAfterPageRemoval()
++{
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char* value = getenv("WISP_MEMORY_RELEASE");
++        enabled = !value || value[0] != '0';
++    }
++    static bool scheduled;
++    if (!enabled || scheduled)
++        return;
++    scheduled = true;
++    RunLoop::mainSingleton().dispatchAfter(2_s, [] {
++        scheduled = false;
++        size_t before = memoryFootprint();
++        WebCore::releaseMemory(Critical::No, Synchronous::No, WebCore::MaintainBackForwardCache::Yes, WebCore::MaintainMemoryCache::No);
++        WebCore::GarbageCollectionController::singleton().garbageCollectOnNextRunLoop();
++        WTFLogAlways("memory: a page left the process: caches released (%zu MiB in use before), a full garbage collection next", before >> 20);
++    });
++}
++#endif
++
+ void WebProcess::removeWebPage(PageIdentifier pageID)
+ {
+     ASSERT(m_pageMap.contains(pageID));
+@@ -1107,6 +1143,9 @@ void WebProcess::removeWebPage(PageIdentifier pageID)
+ #if OS(LINUX)
+     HighPriorityThreads::singleton().setEnabled(hasVisibleWebPage());
+ #endif
++#if defined(__ORBIS__)
++    wispReleaseMemoryAfterPageRemoval();
++#endif
+ }
+ 
+ bool WebProcess::shouldTerminate()
+-- 
+2.53.0
+

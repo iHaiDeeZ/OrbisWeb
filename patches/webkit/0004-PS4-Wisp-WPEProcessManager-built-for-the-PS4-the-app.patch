@@ -1,0 +1,45 @@
+From 67658127a9732a819b9b72e07931757a5a44a61b Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Tue, 17 Nov 2026 19:52:11 +0300
+Subject: [PATCH 04/12] PS4 (Wisp): WPEProcessManager built for the PS4 (the
+ app launches the processes)
+
+---
+ Source/WebKit/WPEPlatform/CMakeLists.txt | 5 +++++
+ Source/cmake/OptionsWPE.cmake            | 4 ++++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/Source/WebKit/WPEPlatform/CMakeLists.txt b/Source/WebKit/WPEPlatform/CMakeLists.txt
+index d996a7ba..5396f66d 100644
+--- a/Source/WebKit/WPEPlatform/CMakeLists.txt
++++ b/Source/WebKit/WPEPlatform/CMakeLists.txt
+@@ -130,6 +130,11 @@ if (ANDROID)
+     list(APPEND WPEPlatform_SOURCES ${WEBKIT_DIR}/WPEPlatform/wpe/WPEProcessManager.cpp)
+     list(APPEND WPEPlatform_INSTALLED_HEADERS ${WEBKIT_DIR}/WPEPlatform/wpe/WPEProcessManager.h)
+ endif ()
++if (WISP_PS4)
++    # PS4 (Wisp): the app starts WebKit's processes as PS4 local processes
++    list(APPEND WPEPlatform_SOURCES ${WEBKIT_DIR}/WPEPlatform/wpe/WPEProcessManager.cpp)
++    list(APPEND WPEPlatform_INSTALLED_HEADERS ${WEBKIT_DIR}/WPEPlatform/wpe/WPEProcessManager.h)
++endif ()
+ 
+ if (USE_ATK)
+     list(APPEND WPEPlatform_LIBRARIES
+diff --git a/Source/cmake/OptionsWPE.cmake b/Source/cmake/OptionsWPE.cmake
+index c7fae02f..5bd86e4d 100644
+--- a/Source/cmake/OptionsWPE.cmake
++++ b/Source/cmake/OptionsWPE.cmake
+@@ -314,6 +314,10 @@ if (ENABLE_WPE_PLATFORM)
+         set(WPE_PLATFORM_BUFFER_ANDROID ON)
+         set(WPE_PLATFORM_PROCESS_MANAGER_ANDROID ON)
+     endif ()
++    if (WISP_PS4)
++        # PS4 (Wisp): the app starts WebKit's processes as PS4 local processes (WPEProcessManager)
++        set(WPE_PLATFORM_PROCESS_MANAGER_ANDROID ON)
++    endif ()
+ 
+     if (ENABLE_WPE_PLATFORM_DRM)
+         find_package(LibInput 1.19.0 REQUIRED)
+-- 
+2.53.0
+

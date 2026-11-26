@@ -1,0 +1,55 @@
+From 88ee8a8ae866a4dbf6d4e677b95cd40ccd27d0d1 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Wed, 25 Nov 2026 22:12:01 +0300
+Subject: [PATCH] PS4 (Wisp): WebAssembly memories: one collection, then
+ waiting
+
+Patch 0042 collected garbage four times when direct memory refused a new memory,
+and each full synchronous collection of a game's heap held the page's thread for
+seconds (26 s in all, until the UI restarted the web process). Now one full
+collection and sweep, then the allocation again every 250 ms for about 2 s, while
+the old page's workers end and let their memory go.
+---
+ Source/JavaScriptCore/wasm/WasmMemory.cpp | 22 +++++++++++++---------
+ 1 file changed, 13 insertions(+), 9 deletions(-)
+
+diff --git a/Source/JavaScriptCore/wasm/WasmMemory.cpp b/Source/JavaScriptCore/wasm/WasmMemory.cpp
+index 13ad98ce..7b16c232 100644
+--- a/Source/JavaScriptCore/wasm/WasmMemory.cpp
++++ b/Source/JavaScriptCore/wasm/WasmMemory.cpp
+@@ -77,19 +77,23 @@ constexpr bool verbose = false;
+ // (PS4, Wisp, v00.41) Direct memory refused for a new memory: what a page left behind may still hold it (a
+ // reload's old page, its garbage not collected yet; the workers of its threads still stopping, each holding
+ // the shared memory). Hot Pursuit 2's reload asked for its 1 GiB while the old page's 1 GiB was held, and
+-// said "Out of memory" (v00.40). A full collection and its sweep, then the allocation again: up to 4 times
+-// over about a second.
++// said "Out of memory" (v00.40). (v00.42) One full collection and its sweep, then the allocation again
++// every 250 ms for about 2 s, for the old page's workers to end: v00.41 collected four times, and each full
++// collection of a game's heap held the page's thread for seconds (26 s in all).
+ static bool wispCollectForMemory(VM& vm, unsigned& attempt, uint64_t bytes)
+ {
+-    if (attempt >= 4)
++    if (attempt >= 8) {
++        WTFLogAlways("WebAssembly (PS4): no direct memory for a memory of %llu MiB, after collecting and 2 s of waiting",
++            static_cast<unsigned long long>(bytes >> 20));
+         return false;
+-    if (attempt)
++    }
++    if (!attempt++) {
++        vm.heap.collectSync(CollectionScope::Full);
++        vm.heap.sweepSynchronously();
++        WTFLogAlways("WebAssembly (PS4): no direct memory for a memory of %llu MiB: garbage collected, trying again",
++            static_cast<unsigned long long>(bytes >> 20));
++    } else
+         WTF::sleep(Seconds::fromMilliseconds(250));
+-    ++attempt;
+-    vm.heap.collectSync(CollectionScope::Full);
+-    vm.heap.sweepSynchronously();
+-    WTFLogAlways("WebAssembly (PS4): no direct memory for a memory of %llu MiB: garbage collected, trying again (%u of 4)",
+-        static_cast<unsigned long long>(bytes >> 20), attempt);
+     return true;
+ }
+ #endif
+-- 
+2.53.0
+

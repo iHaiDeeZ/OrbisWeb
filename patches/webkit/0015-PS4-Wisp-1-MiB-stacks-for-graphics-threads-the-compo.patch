@@ -1,0 +1,30 @@
+From 56b431b010aaa41d7b8fcc6cca247e5571159b9c Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Thu, 19 Nov 2026 20:45:56 +0300
+Subject: [PATCH] PS4 (Wisp): 1 MiB stacks for graphics threads (the compositor
+ and scrolling threads compile shaders through Mesa)
+
+---
+ Source/WTF/wtf/Threading.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/Source/WTF/wtf/Threading.cpp b/Source/WTF/wtf/Threading.cpp
+index c72d22af..86a3c727 100644
+--- a/Source/WTF/wtf/Threading.cpp
++++ b/Source/WTF/wtf/Threading.cpp
+@@ -105,6 +105,12 @@ static std::optional<size_t> NODELETE stackSize(ThreadType threadType)
+     // of the flexible memory pool the app's processes share)
+     if (threadType == ThreadType::JavaScript)
+         return 512 * KB;
++#if defined(__ORBIS__)
++    // Wisp: the compositor and the scrolling thread draw with GL, and Mesa compiles their shaders on
++    // them (GLSL); the app's minimum (256 KiB) serves the rest
++    if (threadType == ThreadType::Graphics)
++        return 1 * MB;
++#endif
+ #elif OS(DARWIN) && (ASAN_ENABLED || ASSERT_ENABLED)
+     if (threadType == ThreadType::Compiler)
+         return 1 * MB; // ASan / Debug build needs more stack space.
+-- 
+2.53.0
+

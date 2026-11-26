@@ -1,0 +1,58 @@
+From 63ccdf5594f454373fa1d8c203aa5b8a5057106d Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Mon, 23 Nov 2026 16:16:08 +0300
+Subject: [PATCH] PS4 (Wisp): no GStreamer registry scan in a process whose
+ GStreamer never started
+
+The UI and network processes are linked with gst_init as a stub (GStreamer's plugins and FFmpeg stay out
+of their program images). The non-web-process path of both registry scanners ignored the answer of
+ensureGStreamerInitializedNonWebProcess() and scanned the uninitialized registry: the network process
+crashed at gstvalue.c on every file:// load of a type that is no image or document
+(NetworkDataTaskSoup::didGetFileInfo -> MIMETypeRegistry::canShowMIMEType -> supportedMediaMIMETypes).
+There, the media types are now none.
+---
+ .../graphics/gstreamer/GStreamerRegistryScanner.cpp         | 6 +++++-
+ .../graphics/gstreamer/mse/GStreamerRegistryScannerMSE.cpp  | 6 +++++-
+ 2 files changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp b/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp
+index f083b32c..eb877266 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/GStreamerRegistryScanner.cpp
+@@ -164,9 +164,13 @@ void teardownGStreamerRegistryScanner()
+ 
+ void GStreamerRegistryScanner::getSupportedDecodingTypes(HashSet<String>& types)
+ {
++    // PS4 (Wisp): no scan where GStreamer did not start. The UI and network processes have no
++    // GStreamer (gst_init is a stub there: its plugins and FFmpeg stay out of their program images); a
++    // scan of its uninitialized registry crashed the network process (gstvalue.c) on file:// loads
++    // of types that are no image or document: canShowMIMEType asks for the media types.
+     if (isInWebProcess())
+         types = singleton().mimeTypeSet(GStreamerRegistryScanner::Configuration::Decoding);
+-    else
++    else if (ensureGStreamerInitializedNonWebProcess())
+         types = GStreamerRegistryScanner().mimeTypeSet(GStreamerRegistryScanner::Configuration::Decoding);
+ }
+ 
+diff --git a/Source/WebCore/platform/graphics/gstreamer/mse/GStreamerRegistryScannerMSE.cpp b/Source/WebCore/platform/graphics/gstreamer/mse/GStreamerRegistryScannerMSE.cpp
+index c9454c6e..bda038d0 100644
+--- a/Source/WebCore/platform/graphics/gstreamer/mse/GStreamerRegistryScannerMSE.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/mse/GStreamerRegistryScannerMSE.cpp
+@@ -46,9 +46,13 @@ void teardownGStreamerRegistryScannerMSE()
+ 
+ void GStreamerRegistryScannerMSE::getSupportedDecodingTypes(HashSet<String>& types)
+ {
++    // PS4 (Wisp): no scan where GStreamer did not start. The UI and network processes have no
++    // GStreamer (gst_init is a stub there: its plugins and FFmpeg stay out of their program images); a
++    // scan of its uninitialized registry crashed the network process (gstvalue.c) on file:// loads
++    // of types that are no image or document: canShowMIMEType asks for the media types.
+     if (isInWebProcess())
+         types = singleton().mimeTypeSet(GStreamerRegistryScanner::Configuration::Decoding);
+-    else
++    else if (ensureGStreamerInitializedNonWebProcess())
+         types = GStreamerRegistryScannerMSE().mimeTypeSet(GStreamerRegistryScanner::Configuration::Decoding);
+ }
+ 
+-- 
+2.53.0
+

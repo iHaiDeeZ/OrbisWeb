@@ -1,0 +1,181 @@
+From 186f81712d94f053a0eb7767aa6c8beffaf4af7c Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Sat, 21 Nov 2026 01:27:08 +0300
+Subject: [PATCH] PS4 (Wisp): a page on show costs the shared pool one frame
+ buffer, not four
+
+The UI process mapped each shared-memory frame buffer from the web process when the buffer was made
+and kept it mapped while it lived; the PS4 charges a shared mapping to the flexible memory pool the
+app processes share in every process that maps it (7.5 MiB per 1920x972 buffer). The UI now keeps
+the buffer handle and maps a duplicate only while a frame of it is copied (AcceleratedBackingStore:
+the WPEBuffer made for the frame goes with its mapping once the view has copied it). The web process
+starts a page swap chain with one buffer instead of two: the UI gives a buffer back before it says
+the frame is done, so the next frame finds it free; nextTarget still makes a second when it is not.
+---
+ .../UIProcess/wpe/AcceleratedBackingStore.cpp | 61 +++++++++++++++++++
+ .../UIProcess/wpe/AcceleratedBackingStore.h   |  7 +++
+ .../CoordinatedGraphics/AcceleratedSurface.h  |  7 +++
+ 3 files changed, 75 insertions(+)
+
+diff --git a/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp b/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp
+index b2db67cb..effb1158 100644
+--- a/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp
++++ b/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp
+@@ -107,6 +107,9 @@ void AcceleratedBackingStore::updateSurfaceID(uint64_t surfaceID)
+         }
+         m_buffers.clear();
+         m_bufferIDs.clear();
++#if defined(__ORBIS__)
++        m_sharedMemoryHandles.clear();
++#endif
+         if (RefPtr legacyMainFrameProcess = m_legacyMainFrameProcess.get())
+             legacyMainFrameProcess->removeMessageReceiver(Messages::AcceleratedBackingStore::messageReceiverName(), m_surfaceID);
+     }
+@@ -155,6 +158,14 @@ void AcceleratedBackingStore::didCreateDMABufBuffer(uint64_t id, WebCore::DMABuf
+ 
+ void AcceleratedBackingStore::didCreateSHMBuffer(uint64_t id, WebCore::ShareableBitmap::Handle&& handle)
+ {
++#if defined(__ORBIS__)
++    // PS4 (Wisp): mapped only while a frame of it is copied (frame(), mapSharedMemoryBuffer). Mapped here,
++    // the buffer stayed mapped for as long as the web process kept it, and the PS4 charges a shared mapping
++    // to the flexible memory pool the app's processes share in every process that maps it: 7.5 MiB per
++    // buffer in this process too, on top of the web process's own mapping
++    m_sharedMemoryHandles.set(id, makeUniqueWithoutFastMallocCheck<WebCore::ShareableBitmap::Handle>(WTF::move(handle)));
++    return;
++#endif
+     auto bitmap = WebCore::ShareableBitmap::create(WTF::move(handle), WebCore::SharedMemory::Protection::ReadOnly);
+     if (!bitmap)
+         return;
+@@ -188,6 +199,9 @@ void AcceleratedBackingStore::didCreateAndroidBuffer(uint64_t id, RefPtr<AHardwa
+ 
+ void AcceleratedBackingStore::didDestroyBuffer(uint64_t id)
+ {
++#if defined(__ORBIS__)
++    m_sharedMemoryHandles.remove(id);
++#endif
+     if (auto buffer = m_buffers.take(id)) {
+         m_bufferIDs.remove(buffer.get());
+ #if defined(__ORBIS__)
+@@ -204,7 +218,11 @@ void AcceleratedBackingStore::didDestroyBuffer(uint64_t id)
+ void AcceleratedBackingStore::frame(uint64_t bufferID, Rects&& damageRects, WTF::UnixFileDescriptor&& renderingFenceFD)
+ {
+     ASSERT(!m_pendingBuffer);
++#if defined(__ORBIS__)
++    GRefPtr<WPEBuffer> buffer = m_sharedMemoryHandles.contains(bufferID) ? mapSharedMemoryBuffer(bufferID) : GRefPtr<WPEBuffer>(m_buffers.get(bufferID));
++#else
+     auto* buffer = m_buffers.get(bufferID);
++#endif
+     if (!buffer) {
+         frameDone();
+         return;
+@@ -219,6 +237,35 @@ void AcceleratedBackingStore::frame(uint64_t bufferID, Rects&& damageRects, WTF:
+         m_fenceMonitor.addFileDescriptor(WTF::move(renderingFenceFD));
+ }
+ 
++#if defined(__ORBIS__)
++// A buffer's frame, mapped for as long as the frame is in use: the view copies it (Wisp's WPE platform
++// copies what changed into the UI's own picture and releases the buffer at once), and the WPEBuffer made
++// here goes with its mapping once nothing holds it (renderPendingBuffer keeps no committed buffer then)
++GRefPtr<WPEBuffer> AcceleratedBackingStore::mapSharedMemoryBuffer(uint64_t id)
++{
++    auto* handle = m_sharedMemoryHandles.get(id);
++    if (!handle)
++        return nullptr;
++    auto bitmap = WebCore::ShareableBitmap::create(WebCore::ShareableBitmap::Handle { *handle }, WebCore::SharedMemory::Protection::ReadOnly);
++    if (!bitmap)
++        return nullptr;
++
++    auto size = bitmap->size();
++    auto data = bitmap->span();
++    auto stride = bitmap->bytesPerRow();
++    GRefPtr<GBytes> bytes = adoptGRef(g_bytes_new_with_free_func(data.data(), data.size(), [](gpointer userData) {
++        adoptRef(static_cast<WebCore::ShareableBitmap*>(userData));
++    }, bitmap.leakRef()));
++
++    GRefPtr<WPEBuffer> buffer = adoptGRef(WPE_BUFFER(wpe_buffer_shm_new(wpe_view_get_display(m_wpeView.get()), size.width(), size.height(), WPE_PIXEL_FORMAT_ARGB8888, bytes.get(), stride)));
++    g_object_set_data_full(G_OBJECT(buffer.get()), "wisp-buffer-id", new uint64_t(id), [](gpointer data) {
++        delete static_cast<uint64_t*>(data);
++    });
++    g_object_set_data(G_OBJECT(buffer.get()), "wisp-mapped-per-frame", GINT_TO_POINTER(1));
++    return buffer;
++}
++#endif
++
+ static Expected<SkImageInfo, String> getImageInfoFromBuffer(const  GRefPtr<WPEBuffer>& buffer)
+ {
+     auto width = wpe_buffer_get_width(buffer.get());
+@@ -305,6 +352,11 @@ void AcceleratedBackingStore::renderPendingBuffer()
+         m_pendingBuffer = nullptr;
+     } else
+         m_committedBuffer = WTF::move(m_pendingBuffer);
++#if defined(__ORBIS__)
++    // a buffer mapped for this frame: not kept (the view has the frame's pixels; keeping it kept the mapping)
++    if (m_committedBuffer && g_object_get_data(G_OBJECT(m_committedBuffer.get()), "wisp-mapped-per-frame"))
++        m_committedBuffer = nullptr;
++#endif
+     m_pendingDamageRects = { };
+ }
+ 
+@@ -321,6 +373,15 @@ void AcceleratedBackingStore::bufferRendered()
+ 
+ void AcceleratedBackingStore::bufferReleased(WPEBuffer* buffer)
+ {
++#if defined(__ORBIS__)
++    if (auto* id = static_cast<uint64_t*>(g_object_get_data(G_OBJECT(buffer), "wisp-buffer-id"))) {
++        auto releaseFence = UnixFileDescriptor { wpe_buffer_take_release_fence(buffer), UnixFileDescriptor::Adopt };
++        if (RefPtr legacyMainFrameProcess = m_legacyMainFrameProcess.get())
++            legacyMainFrameProcess->send(Messages::AcceleratedSurface::ReleaseBuffer(*id, WTF::move(releaseFence)), m_surfaceID);
++        g_object_set_data(G_OBJECT(buffer), "wisp-buffer-id", nullptr);   // (given back once)
++        return;
++    }
++#endif
+     if (auto id = m_bufferIDs.get(buffer)) {
+         auto releaseFence = UnixFileDescriptor { wpe_buffer_take_release_fence(buffer), UnixFileDescriptor::Adopt };
+ 
+diff --git a/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.h b/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.h
+index dcb02699..4ce68df8 100644
+--- a/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.h
++++ b/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.h
+@@ -98,6 +98,9 @@ private:
+     void toplevelChanged();
+ 
+     void notifyBufferConfigurationIfNeeded();
++#if defined(__ORBIS__)
++    GRefPtr<WPEBuffer> mapSharedMemoryBuffer(uint64_t id);
++#endif
+ 
+     WeakPtr<WebPageProxy> m_webPage;
+     GRefPtr<WPEView> m_wpeView;
+@@ -109,6 +112,10 @@ private:
+     Rects m_pendingDamageRects;
+     HashMap<uint64_t, GRefPtr<WPEBuffer>> m_buffers;
+     HashMap<WPEBuffer*, uint64_t> m_bufferIDs;
++#if defined(__ORBIS__)
++    // PS4 (Wisp): the web process's shared-memory buffers, mapped per frame (mapSharedMemoryBuffer)
++    HashMap<uint64_t, std::unique_ptr<WebCore::ShareableBitmapHandle>> m_sharedMemoryHandles;
++#endif
+     std::optional<unsigned> m_targetBufferCount;
+ };
+ 
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
+index 6c657b5b..a48b28f8 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
+@@ -406,7 +406,14 @@ private:
+ 
+     private:
+         // FIXME: Allow configuring the initial buffer count, e.g. for triple buffering.
++#if defined(__ORBIS__)
++        // PS4 (Wisp): one to start with. The UI copies each frame and gives its buffer back before it says
++        // the frame is done, so the next frame finds it free; nextTarget() still makes a second one when
++        // it is not (7.5 MiB of the flexible pool in this process per buffer)
++        static constexpr unsigned s_initialBuffers = 1;
++#else
+         static constexpr unsigned s_initialBuffers = 2;
++#endif
+ #if defined(__ORBIS__)
+         // PS4 (Wisp): each buffer (a 1920x972 page: 7.5 MiB) is mapped in this process and in the UI,
+         // out of the flexible memory pool the app's processes share; the UI copies a frame and gives
+-- 
+2.53.0
+

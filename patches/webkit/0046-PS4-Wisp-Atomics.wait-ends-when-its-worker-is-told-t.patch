@@ -1,0 +1,54 @@
+From a298c06069d1660ae2007f706acf9b8458f2dc5d Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Thu, 26 Nov 2026 01:46:10 +0300
+Subject: [PATCH] PS4 (Wisp): Atomics.wait ends when its worker is told to stop
+
+A terminating worker's VM only raises the NeedTermination trap bit; hasTerminationRequest() becomes true
+when the thread handles its traps, which a thread parked in Atomics.wait never does. 0043's 100 ms
+slices checked hasTerminationRequest() alone and went on for good: in v00.42 Hot Pursuit 2's 20 game
+threads still waited 17 minutes after their tab had closed, holding its 1 GiB WebAssembly memory, and
+every later game's memory (two N64 emulators, Midnight Club 3) was refused.
+
+The wait now also ends on the trap bit, and sets the termination request as VMTraps::handleTraps would,
+so the TerminationException thrown for Terminated has it.
+---
+ .../JavaScriptCore/runtime/WaiterListManager.cpp | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/Source/JavaScriptCore/runtime/WaiterListManager.cpp b/Source/JavaScriptCore/runtime/WaiterListManager.cpp
+index 0bb82a64..ace9c33a 100644
+--- a/Source/JavaScriptCore/runtime/WaiterListManager.cpp
++++ b/Source/JavaScriptCore/runtime/WaiterListManager.cpp
+@@ -96,8 +96,15 @@ WaiterListManager::WaitSyncResult WaiterListManager::waitSyncImpl(VM& vm, ValueT
+         // PS4 (Wisp): in slices of 100 ms at most. A terminating worker's VM wakes its waiter without the
+         // list's lock (VMTraps::requestThreadStopIfNeeded): a waiter about to park missed it and slept for
+         // good, its worker never ended, and the shared WebAssembly memory it held stayed (v00.41: Hot
+-        // Pursuit 2's 20 game threads outlived their page, and its reload's 1 GiB memory was refused)
+-        while (syncWaiter->isOnList() && time.now() < time && !vm.hasTerminationRequest())
++        // Pursuit 2's 20 game threads outlived their page, and its reload's 1 GiB memory was refused).
++        // And a termination request is only a trap bit until this thread handles its traps, which a thread
++        // parked here never does: hasTerminationRequest() stayed false and the slices went on for good
++        // (v00.42: the same 20 threads still waited 17 minutes after their tab closed, with its 1 GiB;
++        // every N64 emulator after it got no memory)
++        const auto terminating = [&] {
++            return vm.hasTerminationRequest() || vm.traps().hasTrapBit(VMTraps::NeedTermination);
++        };
++        while (syncWaiter->isOnList() && time.now() < time && !terminating())
+             syncWaiter->condition().waitUntil(list->lock, std::min(time, MonotonicTime::now() + Seconds::fromMilliseconds(100)).approximate<WallTime>());
+ #else
+         while (syncWaiter->isOnList() && time.now() < time && !vm.hasTerminationRequest())
+@@ -111,6 +118,11 @@ WaiterListManager::WaitSyncResult WaiterListManager::waitSyncImpl(VM& vm, ValueT
+ 
+         didGetDequeued = list->findAndRemove(listLocker, syncWaiter);
+         ASSERT(didGetDequeued);
++#if defined(__ORBIS__)
++        // (as VMTraps::handleTraps does for the trap: the TerminationException thrown for Terminated wants it)
++        if (!vm.hasTerminationRequest() && vm.traps().hasTrapBit(VMTraps::NeedTermination))
++            vm.setHasTerminationRequest();
++#endif
+         return vm.hasTerminationRequest() ? WaitSyncResult::Terminated : WaitSyncResult::TimedOut;
+     }
+ }
+-- 
+2.53.0
+

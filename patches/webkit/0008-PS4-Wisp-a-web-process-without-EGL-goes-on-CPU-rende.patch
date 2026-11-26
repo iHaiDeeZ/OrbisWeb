@@ -1,0 +1,49 @@
+From f6dba1de42991614e6101c5b7e991c842270998b Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Tue, 17 Nov 2026 20:28:54 +0300
+Subject: [PATCH 08/12] PS4 (Wisp): a web process without EGL goes on (CPU
+ rendering)
+
+---
+ .../platform/graphics/egl/PlatformDisplaySurfaceless.cpp    | 6 ++++++
+ Source/WebKit/WebProcess/glib/WebProcessGLib.cpp            | 5 +++++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp b/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
+index f7ad5f60..f8c483b4 100644
+--- a/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
++++ b/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
+@@ -44,8 +44,14 @@ std::unique_ptr<PlatformDisplaySurfaceless> PlatformDisplaySurfaceless::create()
+         glDisplay = GLDisplay::create(eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr));
+ 
+     if (!glDisplay) {
++#if defined(__ORBIS__)
++        // PS4 (Wisp): pages can still be drawn on the CPU; the caller goes on without GL
++        WTFLogAlways("Could not create surfaceless EGL display: %s. No GL in this web process.", GLContext::lastErrorString());
++        return nullptr;
++#else
+         WTFLogAlways("Could not create surfaceless EGL display: %s. Aborting...", GLContext::lastErrorString());
+         CRASH();
++#endif
+     }
+ 
+     return std::unique_ptr<PlatformDisplaySurfaceless>(new PlatformDisplaySurfaceless(glDisplay.releaseNonNull()));
+diff --git a/Source/WebKit/WebProcess/glib/WebProcessGLib.cpp b/Source/WebKit/WebProcess/glib/WebProcessGLib.cpp
+index 85bc7f23..bb87e71a 100644
+--- a/Source/WebKit/WebProcess/glib/WebProcessGLib.cpp
++++ b/Source/WebKit/WebProcess/glib/WebProcessGLib.cpp
+@@ -186,6 +186,11 @@ void WebProcess::initializePlatformDisplayIfNeeded() const
+     }
+ #endif
+ 
++#if defined(__ORBIS__)
++    // PS4 (Wisp): no GL; CPU rendering (WISP_CPU_RENDERING in the UI process) needs none
++    WTFLogAlways("Could not create EGL display: pages can only be drawn on the CPU.");
++    return;
++#endif
+     WTFLogAlways("Could not create EGL display: no supported platform available. Aborting...");
+     CRASH();
+ }
+-- 
+2.53.0
+

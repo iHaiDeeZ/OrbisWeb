@@ -1,0 +1,41 @@
+From 764f29bd5b39954ca84504534027d7f0866d0f3a Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Wed, 25 Nov 2026 22:12:00 +0300
+Subject: [PATCH] PS4 (Wisp): Atomics.wait checks for termination every 100 ms
+
+A terminating worker's VM wakes its Atomics.wait waiter from
+VMTraps::requestThreadStopIfNeeded without the waiter list's lock: a waiter that had
+checked hasTerminationRequest() and was about to park missed the notification and
+slept for good (no timeout). Its worker never ended, and the shared WebAssembly
+memory it held stayed: a game's 20 threads outlived their page, and the reload's
+1 GiB memory was refused. On __ORBIS__ a synchronous wait parks in slices of 100 ms
+at most, rechecking for termination after each.
+---
+ Source/JavaScriptCore/runtime/WaiterListManager.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/Source/JavaScriptCore/runtime/WaiterListManager.cpp b/Source/JavaScriptCore/runtime/WaiterListManager.cpp
+index 5df3695b..0bb82a64 100644
+--- a/Source/JavaScriptCore/runtime/WaiterListManager.cpp
++++ b/Source/JavaScriptCore/runtime/WaiterListManager.cpp
+@@ -92,8 +92,17 @@ WaiterListManager::WaitSyncResult WaiterListManager::waitSyncImpl(VM& vm, ValueT
+         list->addLast(listLocker, syncWaiter);
+         dataLogLnIf(WaiterListsManagerInternal::verbose, "<WaiterListManager> <Thread:", Thread::currentSingleton(), "> added a new SyncWaiter=", syncWaiter.get(), " to a waiterList for ptr ", RawPointer(ptr));
+ 
++#if defined(__ORBIS__)
++        // PS4 (Wisp): in slices of 100 ms at most. A terminating worker's VM wakes its waiter without the
++        // list's lock (VMTraps::requestThreadStopIfNeeded): a waiter about to park missed it and slept for
++        // good, its worker never ended, and the shared WebAssembly memory it held stayed (v00.41: Hot
++        // Pursuit 2's 20 game threads outlived their page, and its reload's 1 GiB memory was refused)
++        while (syncWaiter->isOnList() && time.now() < time && !vm.hasTerminationRequest())
++            syncWaiter->condition().waitUntil(list->lock, std::min(time, MonotonicTime::now() + Seconds::fromMilliseconds(100)).approximate<WallTime>());
++#else
+         while (syncWaiter->isOnList() && time.now() < time && !vm.hasTerminationRequest())
+             syncWaiter->condition().waitUntil(list->lock, time.approximate<WallTime>());
++#endif
+ 
+         // At this point, syncWaiter should be either notified (dequeued) or timeout (not dequeued).
+         bool didGetDequeued = !syncWaiter->isOnList();
+-- 
+2.53.0
+

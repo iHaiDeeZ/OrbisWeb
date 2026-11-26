@@ -1,0 +1,132 @@
+From bd311aafb776f6e4434997df7b7bf3c2d4a30a3a Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Thu, 26 Nov 2026 16:38:38 +0300
+Subject: [PATCH] PS4 (Wisp): thread names for the kit, and frame counters
+
+The kit (ps4-kit runtime) watches every thread for its crash and hang dumps
+and its hot-spot profiler, and named them all "(unnamed)": a thread dump of a
+game page listed sixty threads nobody could tell apart. WTF's
+Thread::initializeCurrentThreadInternal now gives the thread's name to the kit
+(ps4_watch_thread, which renames the slot the kit gave the thread at its
+start; a weak no-op here for a binary without the kit).
+
+Counters the web process logs every 10 s (app/src/child), so a slow page shows
+where its frames go: the page's rendering updates (WebPage::updateRendering:
+its animation frames, style, layout and painting) and the time in them, and
+the compositor's frames (ThreadedCompositor::renderLayerTree, from the first
+drawing to the frame sent) and the time in them. wisp_frame_counters lives in
+WTF/wtf/ps4/MemoryPS4.cpp; slots 4-7 are WebGPU canvases'.
+---
+ Source/WTF/wtf/posix/ThreadingPOSIX.cpp             | 10 ++++++++++
+ Source/WTF/wtf/ps4/MemoryPS4.cpp                    |  7 +++++++
+ .../CoordinatedGraphics/ThreadedCompositor.cpp      | 13 +++++++++++++
+ Source/WebKit/WebProcess/WebPage/WebPage.cpp        | 12 ++++++++++++
+ 4 files changed, 42 insertions(+)
+
+diff --git a/Source/WTF/wtf/posix/ThreadingPOSIX.cpp b/Source/WTF/wtf/posix/ThreadingPOSIX.cpp
+index a64641f8..222e3341 100644
+--- a/Source/WTF/wtf/posix/ThreadingPOSIX.cpp
++++ b/Source/WTF/wtf/posix/ThreadingPOSIX.cpp
+@@ -460,8 +460,18 @@ void Thread::initializeSchedulingAttributes()
+ #endif
+ }
+ 
++#if defined(__ORBIS__)
++// PS4 (Wisp): the kit (ps4-kit runtime) watches every thread for its crash and hang dumps and its hot-spot
++// profiler, all "(unnamed)" until a thread names itself there. A weak no-op here, for a binary without the kit.
++extern "C" __attribute__((weak)) void ps4_watch_thread(const char*) { }
++#endif
++
+ void Thread::initializeCurrentThreadInternal(const char* threadName)
+ {
++#if defined(__ORBIS__)
++    if (threadName)
++        ps4_watch_thread(normalizeThreadName(threadName));
++#endif
+ #if HAVE(PTHREAD_SETNAME_NP)
+     pthread_setname_np(normalizeThreadName(threadName));
+ #elif OS(HAIKU)
+diff --git a/Source/WTF/wtf/ps4/MemoryPS4.cpp b/Source/WTF/wtf/ps4/MemoryPS4.cpp
+index 01dec732..1a2208eb 100644
+--- a/Source/WTF/wtf/ps4/MemoryPS4.cpp
++++ b/Source/WTF/wtf/ps4/MemoryPS4.cpp
+@@ -22,6 +22,13 @@
+ 
+ extern "C" {
+ 
++// PS4 (Wisp): frame counters the web process logs every 10 s ("frames:" in web.log, app/src/child):
++// [0] the page's rendering updates (WebPage::updateRendering: its animation frames, style, layout, painting)
++// and [1] microseconds in them; [2] the compositor's frames and [3] microseconds in them (ThreadedCompositor);
++// [4] WebGPU canvas frames presented, [5] those dropped (the GPU two frames behind), [6] those shown (read
++// back), [7] canvas textures made (WebGPUPresentationContextImpl). Atomic adds, relaxed.
++unsigned long long wisp_frame_counters[8];
++
+ __attribute__((weak)) size_t wisp_memory_footprint(void)
+ {
+     return 0;
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
+index 48944dc4..41a51a1c 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
+@@ -526,6 +526,10 @@ static String reasonsToString(const OptionSet<CompositionReason>& reasons)
+ }
+ #endif
+ 
++#if defined(__ORBIS__)
++extern "C" unsigned long long wisp_frame_counters[8];
++#endif
++
+ void ThreadedCompositor::renderLayerTree()
+ {
+     ASSERT(m_sceneState);
+@@ -578,6 +582,11 @@ void ThreadedCompositor::renderLayerTree()
+     if (viewportSize.isEmpty())
+         return;
+ 
++#if defined(__ORBIS__)
++    // PS4 (Wisp): a frame from here on (WTF/wtf/ps4/MemoryPS4.cpp)
++    const auto wispStart = MonotonicTime::now();
++#endif
++
+     TransformationMatrix viewportTransform;
+     viewportTransform.scale(deviceScaleFactor);
+ 
+@@ -610,6 +619,10 @@ void ThreadedCompositor::renderLayerTree()
+ 
+     m_surface->didRenderFrame(targetContents);
+     m_surface->sendFrame();
++#if defined(__ORBIS__)
++    __atomic_fetch_add(&wisp_frame_counters[2], 1ull, __ATOMIC_RELAXED);
++    __atomic_fetch_add(&wisp_frame_counters[3], static_cast<unsigned long long>((MonotonicTime::now() - wispStart).microseconds()), __ATOMIC_RELAXED);
++#endif
+ 
+     RunLoop::mainSingleton().dispatch([this, protectedThis = Ref { *this }] {
+         if (m_layerTreeHost)
+diff --git a/Source/WebKit/WebProcess/WebPage/WebPage.cpp b/Source/WebKit/WebProcess/WebPage/WebPage.cpp
+index d0a7a878..772d5568 100644
+--- a/Source/WebKit/WebProcess/WebPage/WebPage.cpp
++++ b/Source/WebKit/WebProcess/WebPage/WebPage.cpp
+@@ -5470,8 +5470,20 @@ void WebPage::layoutIfNeeded()
+     protect(corePage())->layoutIfNeeded();
+ }
+ 
++#if defined(__ORBIS__)
++extern "C" unsigned long long wisp_frame_counters[8];
++#endif
++
+ void WebPage::updateRendering()
+ {
++#if defined(__ORBIS__)
++    // PS4 (Wisp): counted for the web process's log (WTF/wtf/ps4/MemoryPS4.cpp)
++    const auto wispStart = MonotonicTime::now();
++    auto wispCount = makeScopeExit([wispStart] {
++        __atomic_fetch_add(&wisp_frame_counters[0], 1ull, __ATOMIC_RELAXED);
++        __atomic_fetch_add(&wisp_frame_counters[1], static_cast<unsigned long long>((MonotonicTime::now() - wispStart).microseconds()), __ATOMIC_RELAXED);
++    });
++#endif
+     protect(corePage())->updateRendering();
+ 
+ #if PLATFORM(IOS_FAMILY)
+-- 
+2.53.0
+

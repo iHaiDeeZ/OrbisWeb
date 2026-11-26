@@ -1,0 +1,79 @@
+From 06c13b108deaa416ce05568d88d56c8f7afe648f Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Wed, 25 Nov 2026 14:02:35 +0300
+Subject: [PATCH] PS4 (Wisp): Arabic's dots where the font puts them
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch 0022 turned HarfBuzz's vertical offsets over as it stored them as glyph origins, taking the
+glyph buffer's y (down) for theirs. But origins in this class go up, as CoreText's do:
+ComplexTextController::advance() turns each paint advance's height over itself ("Increasing y points
+down"). Turned twice, every offset went the wrong way. Noto's Arabic fonts draw the dots as separate
+glyphs that GPOS moves onto their letters (Noto Naskh Arabic: dot above -428/1000 em onto a medial noon),
+so the dots above were drawn up to a line too high and those below went into the letters ("سنة" read
+"سه", "بحياتي" read "بحيابي"). HarfBuzz's offsets are stored as they come again.
+
+The glyph buffer's initial advance, the run's first glyph origin, went in unturned (up) as well: a
+left-to-right run whose first glyph the font moves up or down drew every glyph off its line by twice the
+offset. Turned for horizontal text under USE(SKIA). Right-to-left runs get theirs from
+FontCascade::layoutComplexText, worked out from the paint advances, which already comes out right.
+
+Checked against HarfBuzz's shaping of the fonts OrbisWeb ships, in a model of advance(),
+layoutComplexText and FontSkia's positions: every glyph where HarfBuzz puts it, both directions.
+---
+ .../platform/graphics/ComplexTextController.cpp    | 14 +++++++++++++-
+ .../graphics/skia/ComplexTextControllerSkia.cpp    | 10 +++++-----
+ 2 files changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/Source/WebCore/platform/graphics/ComplexTextController.cpp b/Source/WebCore/platform/graphics/ComplexTextController.cpp
+index 7e4690df..11cf1bd6 100644
+--- a/Source/WebCore/platform/graphics/ComplexTextController.cpp
++++ b/Source/WebCore/platform/graphics/ComplexTextController.cpp
+@@ -604,8 +604,20 @@ void ComplexTextController::advance(unsigned offset, GlyphBuffer* glyphBuffer, G
+         // We must store the initial advance for the first glyph we are going to draw.
+         // When leftmostGlyph is 0, it represents the first glyph to draw, taking into
+         // account the text direction.
+-        if (!indexOfLeftmostGlyphInCurrentRun && glyphBuffer)
++        if (!indexOfLeftmostGlyphInCurrentRun && glyphBuffer) {
++#if USE(SKIA)
++            // PS4 (Wisp): the run's initial advance is its first glyph's origin, up like every origin here,
++            // and the glyph buffer's heights go down (as each paint advance's is turned below): turned, so a
++            // left-to-right run whose first glyph the font moves up or down keeps its line (right-to-left
++            // runs get theirs from FontCascade::layoutComplexText, worked out in the buffer's terms)
++            auto initialAdvance = complexTextRun->initialAdvance();
++            if (complexTextRun->font().platformData().orientation() == FontOrientation::Horizontal)
++                initialAdvance.setHeight(-initialAdvance.height());
++            glyphBuffer->setInitialAdvance(makeGlyphBufferAdvance(initialAdvance));
++#else
+             glyphBuffer->setInitialAdvance(makeGlyphBufferAdvance(complexTextRun->initialAdvance()));
++#endif
++        }
+ 
+         while (m_glyphInCurrentRun < glyphCount) {
+             unsigned glyphStartOffset = complexTextRun->indexAt(glyphIndexIntoCurrentRun);
+diff --git a/Source/WebCore/platform/graphics/skia/ComplexTextControllerSkia.cpp b/Source/WebCore/platform/graphics/skia/ComplexTextControllerSkia.cpp
+index 4e087e22..af69c2c0 100644
+--- a/Source/WebCore/platform/graphics/skia/ComplexTextControllerSkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/ComplexTextControllerSkia.cpp
+@@ -79,12 +79,12 @@ ComplexTextController::ComplexTextRun::ComplexTextRun(hb_buffer_t* buffer, const
+         }
+ 
+         float offsetX = harfBuzzPositionToFloat(glyphPositions[i].x_offset);
++        // PS4 (Wisp): kept as HarfBuzz gives it (up), as glyph origins are everywhere in this class:
++        // ComplexTextController::advance() turns each paint advance's height to the glyph buffer's (down).
++        // Patch 0022 turned it over here as well, and Arabic's dots, separate glyphs that GPOS moves onto
++        // their letters in Noto's Arabic fonts, went the other way: those above up to a line too high,
++        // those below into the letters (v00.34: "Arabic still not looking well")
+         float offsetY = harfBuzzPositionToFloat(glyphPositions[i].y_offset);
+-        // PS4 (Wisp): HarfBuzz's offsets go up, the glyph buffer's go down (they are in the context's
+-        // coordinates, as FontCascadeCoreText.cpp says of its positions): horizontal text's turned over
+-        // (vertical text keeps upstream's handling)
+-        if (m_font->platformData().orientation() == FontOrientation::Horizontal)
+-            offsetY = -offsetY;
+         float advanceX = harfBuzzPositionToFloat(glyphPositions[i].x_advance);
+         float advanceY = harfBuzzPositionToFloat(glyphPositions[i].y_advance);
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,521 @@
+From 22430f182fcee27be045adbd54a2d7476b279caf Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Fri, 20 Nov 2026 02:24:28 +0300
+Subject: [PATCH] PS4 (Wisp): WebKit's pages in direct memory, not the flexible
+ memory pool the app's processes share
+
+OSAllocator commits (JSC's structure heap, conservative roots and the like) took flexible memory,
+which comes out of one pool the app's processes share (about 450 MiB at the start, 1 GiB at most)
+with every program image, thread stack and shared buffer; an empty pool freezes the app. They now
+take pages of 2 MiB direct-memory blocks (the app has about 4.5 GiB), mapped where the commit is.
+Decommit and releaseDecommitted (decommitAndRelease comes there with its memory still mapped) find
+each page's place in direct memory with sceKernelVirtualQuery, unmap it, then give it back; a block
+with nothing in use goes back to the kernel when two empty ones are kept. Flexible memory stays the
+fallback when direct memory runs out, when the kernel does not say where a mapped page is (checked
+once), and with WISP_WEBKIT_PAGES=flexible. The footprint WebKit's memory pressure handler reads
+includes the pages in use.
+---
+ Source/WTF/wtf/ps4/MemoryPS4.cpp      |   7 +-
+ Source/WTF/wtf/ps4/OSAllocatorPS4.cpp | 384 ++++++++++++++++++++++++--
+ 2 files changed, 371 insertions(+), 20 deletions(-)
+
+diff --git a/Source/WTF/wtf/ps4/MemoryPS4.cpp b/Source/WTF/wtf/ps4/MemoryPS4.cpp
+index d35ae834..01dec732 100644
+--- a/Source/WTF/wtf/ps4/MemoryPS4.cpp
++++ b/Source/WTF/wtf/ps4/MemoryPS4.cpp
+@@ -9,6 +9,9 @@
+  *   wisp_memory_footprint()  bytes this process has allocated now (heaps + JS)
+  *   wisp_memory_budget()     bytes this process should stay under
+  *
++ * WebKit's own pages (ps4/OSAllocatorPS4.cpp: JSC's structure heap and the like, in direct memory
++ * outside the kit's heaps since Wisp v00.17) are added to the footprint here.
++ *
+  * The defaults here are weak; the app defines both (ports/wisp/runtime).
+  */
+ 
+@@ -29,13 +32,15 @@ __attribute__((weak)) size_t wisp_memory_budget(void)
+     return static_cast<size_t>(1536) << 20;
+ }
+ 
++size_t wtf_ps4_page_memory(size_t* held);
++
+ }
+ 
+ namespace WTF {
+ 
+ void currentProcessMemoryStatus(ProcessMemoryStatus& memoryStatus)
+ {
+-    size_t footprint = wisp_memory_footprint();
++    size_t footprint = wisp_memory_footprint() + wtf_ps4_page_memory(nullptr);
+     memoryStatus.size = footprint;
+     memoryStatus.resident = footprint;
+     memoryStatus.shared = 0;
+diff --git a/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp b/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp
+index d04e0b65..4e478389 100644
+--- a/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp
++++ b/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp
+@@ -12,9 +12,18 @@
+  *
+  *   reserve   sceKernelReserveVirtualRange with the alignment asked for, placed well above the
+  *             kernel library's own allocations (as the kit's heap does)
+- *   commit    flexible memory mapped MAP_FIXED over the range: the system pool first (as the kit's
+- *             mmap does), then the app's regular pool
+- *   decommit  a reservation mapped MAP_FIXED over the range again
++ *   commit    direct memory mapped MAP_FIXED over the range: pages of 2 MiB blocks this allocator
++ *             takes from the kernel; flexible memory (the system pool first, as the kit's mmap does,
++ *             then the app's regular pool) when there is no direct memory left
++ *   decommit  a reservation mapped MAP_FIXED over the range again; its direct memory goes back to
++ *             the blocks, and a block with nothing in use back to the kernel (two are kept)
++ *
++ * Why direct memory (Wisp v00.17; commits were flexible memory before): flexible memory comes out of
++ * one pool the app's processes share (about 450 MiB when the app starts, 1 GiB at most), which also
++ * holds every program image, thread stack and shared buffer, and an empty pool freezes the app (Wisp
++ * v00.13); the app has about 4.5 GiB of direct memory. WISP_WEBKIT_PAGES=flexible in the environment
++ * brings flexible memory back, and so does a kernel that does not say where a mapped page is in
++ * direct memory (checked once, before the first commit).
+  *
+  * The kernel's pages are 16 KiB; WTF's pageSize() may say 4 KiB (musl's getpagesize). Commits are
+  * widened to whole kernel pages without remapping pages that already have memory, and decommits
+@@ -29,10 +38,13 @@
+ #include <wtf/OSAllocator.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <errno.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <sys/mman.h>
++#include <sys/types.h>
+ #include <wtf/Assertions.h>
+ #include <wtf/Lock.h>
+ #include <wtf/MathExtras.h>
+@@ -44,6 +56,15 @@ int sceKernelMapNamedSystemFlexibleMemory(void** address, size_t length, int pro
+ int sceKernelMapNamedFlexibleMemory(void** address, size_t length, int protection, int flags, const char* name);
+ int sceKernelMunmap(void* address, size_t length);
+ int sceKernelQueryMemoryProtection(void* address, void** start, void** end, uint32_t* protection);
++
++// (other names: OpenOrbis' headers declare some of these with their own types)
++int wtfKernelAllocateDirectMemory(off_t searchStart, off_t searchEnd, size_t length, size_t alignment, int memoryType, off_t* physical)
++    __asm__("sceKernelAllocateDirectMemory");
++int wtfKernelMapNamedDirectMemory(void** address, size_t length, int protection, int flags, off_t physical, size_t alignment, const char* name)
++    __asm__("sceKernelMapNamedDirectMemory");
++int wtfKernelReleaseDirectMemory(off_t start, size_t length) __asm__("sceKernelReleaseDirectMemory");
++size_t wtfKernelGetDirectMemorySize() __asm__("sceKernelGetDirectMemorySize");
++int wtfKernelVirtualQuery(const void* address, int flags, void* info, size_t size) __asm__("sceKernelVirtualQuery");
+ }
+ 
+ namespace WTF {
+@@ -125,39 +146,350 @@ void* reserveRange(size_t bytes, size_t alignment, const void* hint)
+     return nullptr;
+ }
+ 
+-// Memory over [begin, end) (kernel pages), replacing the reservation there
+-bool mapMemory(uintptr_t begin, uintptr_t end, int protection, const char* name)
++// --- Direct memory for commits ------------------------------------------------------------------
++//
++// 2 MiB blocks of direct memory from the kernel, handed out a kernel page at a time (a run of pages
++// when a commit is larger) and mapped where the commit is. Where a decommitted page is in direct
++// memory comes from sceKernelVirtualQuery; the page is unmapped before it goes back to its block, so
++// no page is ever mapped twice.
++
++constexpr size_t blockSize = 2 * MB;
++constexpr unsigned pagesPerBlock = blockSize / kernelPage;
++constexpr unsigned maximumBlocks = 2048; // 4 GiB
++constexpr unsigned keptEmptyBlocks = 2;
++constexpr int writeBackMemory = 0; // SCE_KERNEL_WB_ONION: the CPU's memory type (the kit's heap uses it too)
++constexpr int queryNext = 1; // sceKernelVirtualQuery: the mapping there, or the next one
++constexpr uint8_t queryDirect = 2; // its kind bits: 1 flexible, 2 direct, 4 stack, 8 pooled, 16 committed
++
++static_assert(pagesPerBlock == 128);
++
++// sceKernelVirtualQuery's record (72 bytes; app/src/common/wisp_memory.cpp reads it the same way)
++struct VirtualQueryInfo {
++    uint64_t start;
++    uint64_t end;
++    uint64_t offset; // where in direct memory `start` is
++    int32_t protection;
++    int32_t memoryType;
++    uint8_t kind;
++    char name[32];
++    uint8_t padding[7];
++};
++static_assert(sizeof(VirtualQueryInfo) == 72);
++
++struct Block {
++    off_t physical;
++    uint64_t used[pagesPerBlock / 64];
++    unsigned usedPages;
++};
++
++Lock poolLock;
++Block blocks[maximumBlocks] WTF_GUARDED_BY_LOCK(poolLock); // by physical address
++unsigned blockCount WTF_GUARDED_BY_LOCK(poolLock) { 0 };
++unsigned emptyBlocks WTF_GUARDED_BY_LOCK(poolLock) { 0 };
++size_t freePages WTF_GUARDED_BY_LOCK(poolLock) { 0 };
++unsigned blockRetryIn WTF_GUARDED_BY_LOCK(poolLock) { 0 };
++std::atomic<size_t> pagesInUse { 0 };
++std::atomic<bool> directMemoryRefused { false };
++
++bool pageUsed(const Block& block, unsigned page)
++{
++    return (block.used[page / 64] >> (page % 64)) & 1;
++}
++
++void markPage(Block& block, unsigned page, bool used)
++{
++    const uint64_t bit = uint64_t(1) << (page % 64);
++    if (used)
++        block.used[page / 64] |= bit;
++    else
++        block.used[page / 64] &= ~bit;
++}
++
++// A block's first run of `wanted` free pages, else its longest: how long (up to `wanted`), and where
++unsigned freeRun(const Block& block, unsigned wanted, unsigned& first)
++{
++    unsigned best = 0;
++    unsigned run = 0;
++    for (unsigned page = 0; page < pagesPerBlock; ++page) {
++        if (pageUsed(block, page)) {
++            run = 0;
++            continue;
++        }
++        if (++run > best) {
++            best = run;
++            first = page + 1 - run;
++            if (best == wanted)
++                break;
++        }
++    }
++    return best;
++}
++
++// Another block from the kernel, in its place by physical address
++Block* addBlock() WTF_REQUIRES_LOCK(poolLock)
++{
++    if (blockCount == maximumBlocks)
++        return nullptr;
++    const off_t limit = static_cast<off_t>(wtfKernelGetDirectMemorySize());
++    off_t physical = 0;
++    if (wtfKernelAllocateDirectMemory(0, limit, blockSize, blockSize, writeBackMemory, &physical)
++        && wtfKernelAllocateDirectMemory(0, limit, blockSize, kernelPage, writeBackMemory, &physical))
++        return nullptr;
++    unsigned at = 0;
++    while (at < blockCount && blocks[at].physical < physical)
++        ++at;
++    memmove(&blocks[at + 1], &blocks[at], (blockCount - at) * sizeof(Block));
++    blocks[at] = Block { physical, { 0, 0 }, 0 };
++    ++blockCount;
++    ++emptyBlocks;
++    freePages += pagesPerBlock;
++    return &blocks[at];
++}
++
++// Up to `wanted` pages of direct memory in one run: how many (0: the kernel has no more), and where.
++// Free pages first, wherever they are (a commit larger than the run found takes the next run), then
++// another block.
++unsigned takePages(size_t wanted, off_t& physical)
++{
++    const unsigned limit = static_cast<unsigned>(std::min<size_t>(wanted, pagesPerBlock));
++    Locker locker { poolLock };
++    Block* chosen = nullptr;
++    unsigned first = 0;
++    unsigned length = 0;
++    for (unsigned i = 0; freePages && i < blockCount && length < limit; ++i) {
++        if (blocks[i].usedPages == pagesPerBlock)
++            continue;
++        unsigned start = 0;
++        const unsigned run = freeRun(blocks[i], limit, start);
++        if (run > length) {
++            chosen = &blocks[i];
++            first = start;
++            length = run;
++        }
++    }
++    if (!length) {
++        // (when the kernel had no block, it is asked again only every 64th time: flexible memory meanwhile)
++        if (blockRetryIn) {
++            --blockRetryIn;
++            return 0;
++        }
++        chosen = addBlock();
++        if (!chosen) {
++            blockRetryIn = 64;
++            return 0;
++        }
++        first = 0;
++        length = limit;
++    }
++    for (unsigned page = first; page < first + length; ++page)
++        markPage(*chosen, page, true);
++    if (!chosen->usedPages)
++        --emptyBlocks;
++    chosen->usedPages += length;
++    freePages -= length;
++    pagesInUse.fetch_add(length, std::memory_order_relaxed);
++    physical = chosen->physical + static_cast<off_t>(first) * static_cast<off_t>(kernelPage);
++    return length;
++}
++
++// Pages back to their blocks (pages that are not the pool's, or not in use, are left alone); a block
++// with nothing in use goes back to the kernel when two empty ones are kept already
++void givePages(off_t physical, size_t count)
++{
++    Locker locker { poolLock };
++    while (count) {
++        // the block holding `physical`: the last one that starts at or below it
++        unsigned low = 0;
++        unsigned high = blockCount;
++        while (low < high) {
++            const unsigned middle = (low + high) / 2;
++            if (blocks[middle].physical <= physical)
++                low = middle + 1;
++            else
++                high = middle;
++        }
++        if (!low || physical >= blocks[low - 1].physical + static_cast<off_t>(blockSize))
++            return;
++        const unsigned index = low - 1;
++        Block& block = blocks[index];
++        const unsigned first = static_cast<unsigned>((physical - block.physical) / static_cast<off_t>(kernelPage));
++        const unsigned length = static_cast<unsigned>(std::min<size_t>(count, pagesPerBlock - first));
++        unsigned given = 0;
++        for (unsigned page = first; page < first + length; ++page) {
++            if (pageUsed(block, page)) {
++                markPage(block, page, false);
++                ++given;
++            }
++        }
++        block.usedPages -= given;
++        freePages += given;
++        pagesInUse.fetch_sub(given, std::memory_order_relaxed);
++        physical += static_cast<off_t>(length) * static_cast<off_t>(kernelPage);
++        count -= length;
++        if (!given || block.usedPages)
++            continue;
++        if (++emptyBlocks <= keptEmptyBlocks || wtfKernelReleaseDirectMemory(block.physical, blockSize))
++            continue;
++        memmove(&blocks[index], &blocks[index + 1], (blockCount - index - 1) * sizeof(Block));
++        --blockCount;
++        --emptyBlocks;
++        freePages -= pagesPerBlock;
++    }
++}
++
++// Once, before the first commit: does the kernel map direct memory where a reservation is, and does
++// sceKernelVirtualQuery say where a mapped page is in direct memory? (Decommits give pages back by
++// what it says: a wrong answer would hand out pages still in use.)
++bool directMemoryWorks()
++{
++    const off_t limit = static_cast<off_t>(wtfKernelGetDirectMemorySize());
++    off_t physical = 0;
++    int result = wtfKernelAllocateDirectMemory(0, limit, 2 * kernelPage, kernelPage, writeBackMemory, &physical);
++    if (result) {
++        fprintf(stderr, "WTF::OSAllocator (PS4): no direct memory (0x%x): WebKit's pages in flexible memory\n", static_cast<unsigned>(result));
++        return false;
++    }
++    bool works = false;
++    VirtualQueryInfo info { };
++    if (auto* range = static_cast<uint8_t*>(reserveRange(2 * kernelPage, kernelPage, nullptr))) {
++        // the allocation's second page at the reservation's second page
++        void* address = range + kernelPage;
++        result = wtfKernelMapNamedDirectMemory(&address, kernelPage, kernelProtRead | kernelProtWrite, kernelMapFixed, physical + static_cast<off_t>(kernelPage), kernelPage, "WebKit");
++        if (!result && address == range + kernelPage) {
++            static_cast<volatile uint8_t*>(address)[100] = 1;
++            const uintptr_t inside = reinterpret_cast<uintptr_t>(address) + 100;
++            if (!wtfKernelVirtualQuery(reinterpret_cast<void*>(inside), 0, &info, sizeof info) && (info.kind & queryDirect) && info.start <= inside && inside < info.end)
++                works = info.offset + (pageDown(inside) - info.start) == static_cast<uint64_t>(physical) + kernelPage;
++        }
++        sceKernelMunmap(range, 2 * kernelPage);
++    }
++    wtfKernelReleaseDirectMemory(physical, 2 * kernelPage);
++    if (works)
++        fprintf(stderr, "WTF::OSAllocator (PS4): WebKit's pages in direct memory (%zu MiB on this console)\n", static_cast<size_t>(limit) >> 20);
++    else
++        fprintf(stderr, "WTF::OSAllocator (PS4): direct memory not usable for WebKit's pages (0x%x, kind %u, offset 0x%llx for 0x%llx): flexible memory\n",
++            static_cast<unsigned>(result), info.kind, static_cast<unsigned long long>(info.offset), static_cast<unsigned long long>(physical + static_cast<off_t>(kernelPage)));
++    return works;
++}
++
++bool useDirectMemory()
++{
++    static const bool wanted = [] {
++        const char* value = getenv("WISP_WEBKIT_PAGES");
++        if (value && !strcmp(value, "flexible")) {
++            fprintf(stderr, "WTF::OSAllocator (PS4): WebKit's pages in flexible memory (WISP_WEBKIT_PAGES)\n");
++            return false;
++        }
++        return directMemoryWorks();
++    }();
++    return wanted && !directMemoryRefused.load(std::memory_order_relaxed);
++}
++
++// Direct memory over [begin, end) (kernel pages), cleared as flexible memory comes: how far it got
++uintptr_t mapDirectMemory(uintptr_t begin, uintptr_t end, int protection, const char* name)
++{
++    uintptr_t at = begin;
++    while (at < end) {
++        off_t physical = 0;
++        const unsigned pages = takePages((end - at) / kernelPage, physical);
++        if (!pages)
++            break;
++        const size_t bytes = pages * kernelPage;
++        void* address = reinterpret_cast<void*>(at);
++        const int result = wtfKernelMapNamedDirectMemory(&address, bytes, protection, kernelMapFixed, physical, kernelPage, name);
++        if (result) {
++            givePages(physical, pages);
++            if (!directMemoryRefused.exchange(true))
++                fprintf(stderr, "WTF::OSAllocator (PS4): mapping direct memory at %p + 0x%zx failed (0x%x): WebKit's pages in flexible memory from now on\n",
++                    address, bytes, static_cast<unsigned>(result));
++            break;
++        }
++        // (the kernel does not clear direct memory, and the pool's pages hold what they held last)
++        memset(address, 0, bytes);
++        at += bytes;
++    }
++    return at;
++}
++
++// Address space only over [begin, end) again (kernel pages)
++bool reserveAgain(uintptr_t begin, uintptr_t end)
+ {
+     void* address = reinterpret_cast<void*>(begin);
+     const size_t bytes = end - begin;
+-    int result = sceKernelMapNamedSystemFlexibleMemory(&address, bytes, protection, kernelMapFixed, name);
+-    if (!result && address == reinterpret_cast<void*>(begin))
++    if (!sceKernelReserveVirtualRange(&address, bytes, kernelMapFixed, kernelPage) && address == reinterpret_cast<void*>(begin))
+         return true;
++    // A mapping the kernel will not replace: unmap it, then reserve the same range
++    sceKernelMunmap(reinterpret_cast<void*>(begin), bytes);
+     address = reinterpret_cast<void*>(begin);
+-    result = sceKernelMapNamedFlexibleMemory(&address, bytes, protection, kernelMapFixed, name);
++    const int result = sceKernelReserveVirtualRange(&address, bytes, kernelMapFixed, kernelPage);
+     if (!result && address == reinterpret_cast<void*>(begin))
+         return true;
+-    report("commit", reinterpret_cast<void*>(begin), bytes, result);
++    report("decommit", reinterpret_cast<void*>(begin), bytes, result);
+     return false;
+ }
+ 
+-// Address space only over [begin, end) again (kernel pages)
+-bool unmapMemory(uintptr_t begin, uintptr_t end)
++// The pool's direct memory in [begin, end) back to it, each part made a reservation again first. True
++// when that was all there was (the whole range is a reservation now).
++bool returnDirectMemory(uintptr_t begin, uintptr_t end)
++{
++    bool all = true;
++    uintptr_t at = begin;
++    while (at < end) {
++        VirtualQueryInfo info;
++        if (wtfKernelVirtualQuery(reinterpret_cast<void*>(at), queryNext, &info, sizeof info) || info.end <= at)
++            return false;
++        if (info.start > at) {
++            // nothing mapped up to there
++            all = false;
++            at = info.start;
++            continue;
++        }
++        const uintptr_t partEnd = std::min<uintptr_t>(info.end, end);
++        if (info.kind & queryDirect) {
++            const off_t physical = static_cast<off_t>(info.offset + (at - info.start));
++            if (!reserveAgain(at, partEnd))
++                return false;
++            givePages(physical, (partEnd - at) / kernelPage);
++        } else
++            all = false;
++        at = partEnd;
++    }
++    return all;
++}
++
++// Memory over [begin, end) (kernel pages), replacing the reservation there: direct memory, flexible
++// memory for what direct memory did not cover
++bool mapMemory(uintptr_t begin, uintptr_t end, int protection, const char* name)
+ {
++    const uintptr_t start = begin;
++    if (useDirectMemory())
++        begin = mapDirectMemory(begin, end, protection, name);
++    if (begin == end)
++        return true;
+     void* address = reinterpret_cast<void*>(begin);
+     const size_t bytes = end - begin;
+-    if (!sceKernelReserveVirtualRange(&address, bytes, kernelMapFixed, kernelPage) && address == reinterpret_cast<void*>(begin))
++    int result = sceKernelMapNamedSystemFlexibleMemory(&address, bytes, protection, kernelMapFixed, name);
++    if (!result && address == reinterpret_cast<void*>(begin))
+         return true;
+-    // A mapping the kernel will not replace: unmap it, then reserve the same range
+-    sceKernelMunmap(reinterpret_cast<void*>(begin), bytes);
+     address = reinterpret_cast<void*>(begin);
+-    const int result = sceKernelReserveVirtualRange(&address, bytes, kernelMapFixed, kernelPage);
++    result = sceKernelMapNamedFlexibleMemory(&address, bytes, protection, kernelMapFixed, name);
+     if (!result && address == reinterpret_cast<void*>(begin))
+         return true;
+-    report("decommit", reinterpret_cast<void*>(begin), bytes, result);
++    report("commit", reinterpret_cast<void*>(begin), bytes, result);
++    // the direct memory it had mapped, back to the pool
++    if (begin > start && !returnDirectMemory(start, begin))
++        reserveAgain(start, begin);
+     return false;
+ }
+ 
++// Address space only over [begin, end) again (kernel pages), the pool's direct memory there back to it
++bool unmapMemory(uintptr_t begin, uintptr_t end)
++{
++    if (pagesInUse.load(std::memory_order_relaxed) && returnDirectMemory(begin, end))
++        return true;
++    return reserveAgain(begin, end);
++}
++
+ bool hasMemory(uintptr_t page)
+ {
+     void* start = nullptr;
+@@ -205,15 +537,16 @@ void* reserveExecutable(size_t bytes, unsigned guardPages)
+     return static_cast<uint8_t*>(base) + guardSize;
+ }
+ 
+-void forgetExecutable(uintptr_t begin, uintptr_t end)
++bool forgetExecutable(uintptr_t begin, uintptr_t end)
+ {
+     Locker locker { executableLock };
+     for (unsigned i = 0; i < executableCount; ++i) {
+         if (executableRanges[i].begin < end && begin < executableRanges[i].end) {
+             executableRanges[i] = executableRanges[--executableCount];
+-            return;
++            return true;
+         }
+     }
++    return false;
+ }
+ 
+ void* reserve(size_t bytes, OSAllocator::Usage usage, void* address, bool writable, bool executable, unsigned guardPages, bool committed, size_t alignment)
+@@ -327,7 +660,9 @@ void OSAllocator::releaseDecommitted(void* address, size_t bytes, unsigned numbe
+     }
+     const uintptr_t end = pageUp(begin + size);
+     begin = pageDown(begin);
+-    forgetExecutable(begin, end);
++    // (decommitAndRelease comes here with its memory still mapped: the pool's pages go back first)
++    if (!forgetExecutable(begin, end) && pagesInUse.load(std::memory_order_relaxed))
++        returnDirectMemory(begin, end);
+     if (munmap(reinterpret_cast<void*>(begin), end - begin) == -1)
+         CRASH();
+ }
+@@ -355,4 +690,15 @@ void OSAllocator::zeroFill(void* base, size_t size)
+     memset(base, 0, size);
+ }
+ 
++// Direct memory WebKit's pages use now, and what this allocator holds of it (`held`; may be null):
++// ps4/MemoryPS4.cpp and the app's memory lines
++extern "C" size_t wtf_ps4_page_memory(size_t* held)
++{
++    if (held) {
++        Locker locker { poolLock };
++        *held = static_cast<size_t>(blockCount) * blockSize;
++    }
++    return pagesInUse.load(std::memory_order_relaxed) * kernelPage;
++}
++
+ } // namespace WTF
+-- 
+2.53.0
+

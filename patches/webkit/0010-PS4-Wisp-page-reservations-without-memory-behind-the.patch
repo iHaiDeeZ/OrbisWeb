@@ -1,0 +1,416 @@
+From fecbf2909ab034dd34db7239eb4df596dee90eda Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Tue, 17 Nov 2026 21:24:22 +0300
+Subject: [PATCH 10/12] PS4 (Wisp): page reservations without memory behind
+ them (OSAllocatorPS4); 128 MiB structure heap as on PlayStation
+
+---
+ .../heap/StructureAlignedMemoryAllocator.cpp  |   2 +-
+ Source/WTF/wtf/PlatformWPE.cmake              |   5 +-
+ Source/WTF/wtf/ps4/OSAllocatorPS4.cpp         | 358 ++++++++++++++++++
+ 3 files changed, 363 insertions(+), 2 deletions(-)
+ create mode 100644 Source/WTF/wtf/ps4/OSAllocatorPS4.cpp
+
+diff --git a/Source/JavaScriptCore/heap/StructureAlignedMemoryAllocator.cpp b/Source/JavaScriptCore/heap/StructureAlignedMemoryAllocator.cpp
+index 1494c4a2..6de0f053 100644
+--- a/Source/JavaScriptCore/heap/StructureAlignedMemoryAllocator.cpp
++++ b/Source/JavaScriptCore/heap/StructureAlignedMemoryAllocator.cpp
+@@ -261,7 +261,7 @@ size_t StructureMemoryManager::computePreferredStructureHeapReservationSize()
+     static std::once_flag onceKey;
+     std::call_once(onceKey, [] {
+         size_t baseSize { 0 };
+-#if PLATFORM(PLAYSTATION) || OS(QNX)
++#if PLATFORM(PLAYSTATION) || OS(QNX) || defined(__ORBIS__)
+         baseSize = 128 * MB;
+ #elif (PLATFORM(IOS_FAMILY) && !CPU(ARM64E)) || PLATFORM(WATCHOS) || PLATFORM(APPLETV)
+         baseSize = 512 * MB;
+diff --git a/Source/WTF/wtf/PlatformWPE.cmake b/Source/WTF/wtf/PlatformWPE.cmake
+index 32ef2148..b7995d2b 100644
+--- a/Source/WTF/wtf/PlatformWPE.cmake
++++ b/Source/WTF/wtf/PlatformWPE.cmake
+@@ -44,14 +44,17 @@ if (ANDROID)
+     )
+ elseif (WISP_PS4)
+     # PS4 (Wisp): no /proc (Linux's process memory status, thread priorities through RealtimeKit);
+-    # the app reports memory (ps4/MemoryPS4.cpp)
++    # the app reports memory (ps4/MemoryPS4.cpp). Pages: reservations without memory behind them
++    # (ps4/OSAllocatorPS4.cpp; the PS4 backs every anonymous mapping and has no MAP_ALIGNED)
+     list(REMOVE_ITEM WTF_SOURCES
+         linux/CurrentProcessMemoryStatus.cpp
+         linux/HighPriorityThreads.cpp
++        posix/OSAllocatorPOSIX.cpp
+     )
+     list(APPEND WTF_SOURCES
+         linux/MemoryFootprintLinux.cpp
+         ps4/MemoryPS4.cpp
++        ps4/OSAllocatorPS4.cpp
+ 
+         unix/MemoryPressureHandlerUnix.cpp
+     )
+diff --git a/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp b/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp
+new file mode 100644
+index 00000000..d04e0b65
+--- /dev/null
++++ b/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp
+@@ -0,0 +1,358 @@
++/*
++ * PS4 (Wisp): WTF's page allocator on the PS4 kernel.
++ *
++ * Modelled on playstation/OSAllocatorPlayStation.cpp (Sony's own port, which builds on a private
++ * library): a reservation is address space only, commit puts memory into part of it, and decommit
++ * turns that part back into address space only.
++ *
++ * The POSIX version cannot work here. The PS4 backs an anonymous mapping with memory the moment it
++ * is made (no overcommit, MAP_NORESERVE means nothing), so its "uncommitted" reservations took real
++ * memory; and the kernel has no MAP_ALIGNED, so JavaScriptCore's structure heap (an aligned
++ * reservation) came back unaligned and JSC stopped the process (Wisp v00.01).
++ *
++ *   reserve   sceKernelReserveVirtualRange with the alignment asked for, placed well above the
++ *             kernel library's own allocations (as the kit's heap does)
++ *   commit    flexible memory mapped MAP_FIXED over the range: the system pool first (as the kit's
++ *             mmap does), then the app's regular pool
++ *   decommit  a reservation mapped MAP_FIXED over the range again
++ *
++ * The kernel's pages are 16 KiB; WTF's pageSize() may say 4 KiB (musl's getpagesize). Commits are
++ * widened to whole kernel pages without remapping pages that already have memory, and decommits
++ * narrowed to the kernel pages entirely inside the range.
++ *
++ * Executable reservations (the JIT's pool, when the JIT is on) are mapped whole through the kit's
++ * mmap, which knows the kinds of executable memory this console allows; commit and decommit leave
++ * them as they are.
++ */
++
++#include "config.h"
++#include <wtf/OSAllocator.h>
++
++#include <algorithm>
++#include <errno.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <wtf/Assertions.h>
++#include <wtf/Lock.h>
++#include <wtf/MathExtras.h>
++#include <wtf/PageBlock.h>
++
++extern "C" {
++int sceKernelReserveVirtualRange(void** address, size_t length, int flags, size_t alignment);
++int sceKernelMapNamedSystemFlexibleMemory(void** address, size_t length, int protection, int flags, const char* name);
++int sceKernelMapNamedFlexibleMemory(void** address, size_t length, int protection, int flags, const char* name);
++int sceKernelMunmap(void* address, size_t length);
++int sceKernelQueryMemoryProtection(void* address, void** start, void** end, uint32_t* protection);
++}
++
++namespace WTF {
++
++namespace {
++
++constexpr int kernelMapFixed = 0x10;
++constexpr int kernelProtRead = 0x1;
++constexpr int kernelProtWrite = 0x2;
++constexpr int kernelProtExec = 0x4;
++constexpr uintptr_t kernelPage = 16 * KB;
++
++// Where reservations go (the kit's heap asks for the same places): the PS4 kernel library puts its
++// own objects (pthread attributes, ...) at 0x200000000, where a kernel-placed reservation lands too.
++constexpr uintptr_t reservationHints[] = { 0x1000000000ull, 0x800000000ull, 0x600000000ull };
++constexpr uintptr_t lowestReservation = 0x400000000ull;
++
++uintptr_t pageDown(uintptr_t value) { return value & ~(kernelPage - 1); }
++uintptr_t pageUp(uintptr_t value) { return (value + kernelPage - 1) & ~(kernelPage - 1); }
++
++const char* nameFor(OSAllocator::Usage usage)
++{
++    switch (usage) {
++    case OSAllocator::StructureAllocatorPages:
++        return "JSC structures";
++    case OSAllocator::JSJITCodePages:
++        return "JSC JIT";
++    default:
++        return "WebKit";
++    }
++}
++
++void report(const char* what, const void* address, size_t bytes, int result)
++{
++    fprintf(stderr, "WTF::OSAllocator (PS4): %s %p + 0x%zx failed (0x%x)\n", what, address, bytes, static_cast<unsigned>(result));
++}
++
++void* tryReserveAt(uintptr_t hint, size_t bytes, size_t alignment)
++{
++    void* address = reinterpret_cast<void*>(hint);
++    if (sceKernelReserveVirtualRange(&address, bytes, 0, alignment))
++        return nullptr;
++    const uintptr_t result = reinterpret_cast<uintptr_t>(address);
++    if (result >= lowestReservation && !(result & (alignment - 1)))
++        return address;
++    sceKernelMunmap(address, bytes);
++    return nullptr;
++}
++
++// Address space only, aligned to `alignment` (a power of two)
++void* reserveRange(size_t bytes, size_t alignment, const void* hint)
++{
++    bytes = pageUp(bytes);
++    alignment = std::max<size_t>(alignment, kernelPage);
++    if (hint && reinterpret_cast<uintptr_t>(hint) >= lowestReservation) {
++        if (void* result = tryReserveAt(reinterpret_cast<uintptr_t>(hint), bytes, alignment))
++            return result;
++    }
++    for (uintptr_t at : reservationHints) {
++        if (void* result = tryReserveAt(at, bytes, alignment))
++            return result;
++    }
++    if (alignment == kernelPage)
++        return nullptr;
++    // If the kernel would not align it: a larger range, trimmed to the aligned part
++    for (uintptr_t at : reservationHints) {
++        void* address = tryReserveAt(at, bytes + alignment, kernelPage);
++        if (!address)
++            continue;
++        const uintptr_t start = reinterpret_cast<uintptr_t>(address);
++        const uintptr_t end = start + bytes + alignment;
++        const uintptr_t aligned = (start + alignment - 1) & ~(static_cast<uintptr_t>(alignment) - 1);
++        if (aligned > start)
++            sceKernelMunmap(address, aligned - start);
++        if (end > aligned + bytes)
++            sceKernelMunmap(reinterpret_cast<void*>(aligned + bytes), end - aligned - bytes);
++        return reinterpret_cast<void*>(aligned);
++    }
++    return nullptr;
++}
++
++// Memory over [begin, end) (kernel pages), replacing the reservation there
++bool mapMemory(uintptr_t begin, uintptr_t end, int protection, const char* name)
++{
++    void* address = reinterpret_cast<void*>(begin);
++    const size_t bytes = end - begin;
++    int result = sceKernelMapNamedSystemFlexibleMemory(&address, bytes, protection, kernelMapFixed, name);
++    if (!result && address == reinterpret_cast<void*>(begin))
++        return true;
++    address = reinterpret_cast<void*>(begin);
++    result = sceKernelMapNamedFlexibleMemory(&address, bytes, protection, kernelMapFixed, name);
++    if (!result && address == reinterpret_cast<void*>(begin))
++        return true;
++    report("commit", reinterpret_cast<void*>(begin), bytes, result);
++    return false;
++}
++
++// Address space only over [begin, end) again (kernel pages)
++bool unmapMemory(uintptr_t begin, uintptr_t end)
++{
++    void* address = reinterpret_cast<void*>(begin);
++    const size_t bytes = end - begin;
++    if (!sceKernelReserveVirtualRange(&address, bytes, kernelMapFixed, kernelPage) && address == reinterpret_cast<void*>(begin))
++        return true;
++    // A mapping the kernel will not replace: unmap it, then reserve the same range
++    sceKernelMunmap(reinterpret_cast<void*>(begin), bytes);
++    address = reinterpret_cast<void*>(begin);
++    const int result = sceKernelReserveVirtualRange(&address, bytes, kernelMapFixed, kernelPage);
++    if (!result && address == reinterpret_cast<void*>(begin))
++        return true;
++    report("decommit", reinterpret_cast<void*>(begin), bytes, result);
++    return false;
++}
++
++bool hasMemory(uintptr_t page)
++{
++    void* start = nullptr;
++    void* end = nullptr;
++    uint32_t protection = 0;
++    if (sceKernelQueryMemoryProtection(reinterpret_cast<void*>(page), &start, &end, &protection))
++        return false;
++    return reinterpret_cast<uintptr_t>(start) <= page && page < reinterpret_cast<uintptr_t>(end) && (protection & (kernelProtRead | kernelProtWrite));
++}
++
++// The executable reservations (mapped whole): commit and decommit inside them do nothing
++struct Range {
++    uintptr_t begin;
++    uintptr_t end;
++};
++Lock executableLock;
++Range executableRanges[8] WTF_GUARDED_BY_LOCK(executableLock);
++unsigned executableCount WTF_GUARDED_BY_LOCK(executableLock) { 0 };
++
++bool isExecutable(const void* address)
++{
++    const uintptr_t at = reinterpret_cast<uintptr_t>(address);
++    Locker locker { executableLock };
++    for (unsigned i = 0; i < executableCount; ++i) {
++        if (executableRanges[i].begin <= at && at < executableRanges[i].end)
++            return true;
++    }
++    return false;
++}
++
++void* reserveExecutable(size_t bytes, unsigned guardPages)
++{
++    const size_t guardSize = guardPages * pageSize();
++    const size_t total = pageUp(bytes + 2 * guardSize);
++    void* base = mmap(nullptr, total, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
++    if (base == MAP_FAILED || !base)
++        return nullptr;
++    {
++        Locker locker { executableLock };
++        if (executableCount < std::size(executableRanges))
++            executableRanges[executableCount++] = { reinterpret_cast<uintptr_t>(base), reinterpret_cast<uintptr_t>(base) + total };
++        else
++            fprintf(stderr, "WTF::OSAllocator (PS4): more than %zu executable reservations\n", std::size(executableRanges));
++    }
++    return static_cast<uint8_t*>(base) + guardSize;
++}
++
++void forgetExecutable(uintptr_t begin, uintptr_t end)
++{
++    Locker locker { executableLock };
++    for (unsigned i = 0; i < executableCount; ++i) {
++        if (executableRanges[i].begin < end && begin < executableRanges[i].end) {
++            executableRanges[i] = executableRanges[--executableCount];
++            return;
++        }
++    }
++}
++
++void* reserve(size_t bytes, OSAllocator::Usage usage, void* address, bool writable, bool executable, unsigned guardPages, bool committed, size_t alignment)
++{
++    if (executable)
++        return reserveExecutable(bytes, guardPages);
++    const size_t guardSize = guardPages * pageSize();
++    const uint8_t* hint = address ? static_cast<uint8_t*>(address) - guardSize : nullptr;
++    auto* base = static_cast<uint8_t*>(reserveRange(bytes + 2 * guardSize, alignment, hint));
++    if (!base)
++        return nullptr;
++    uint8_t* result = base + guardSize;
++    if (committed) {
++        const int protection = kernelProtRead | (writable ? kernelProtWrite : 0);
++        const uintptr_t begin = pageDown(reinterpret_cast<uintptr_t>(result));
++        const uintptr_t end = pageUp(reinterpret_cast<uintptr_t>(result) + bytes);
++        if (!mapMemory(begin, end, protection, nameFor(usage))) {
++            sceKernelMunmap(base, pageUp(bytes + 2 * guardSize));
++            return nullptr;
++        }
++    }
++    return result;
++}
++
++} // namespace
++
++void* OSAllocator::tryReserveAndCommit(size_t bytes, Usage usage, void* address, bool writable, bool executable, bool, unsigned numGuardPagesToAddOnEachEnd)
++{
++    return reserve(bytes, usage, address, writable, executable, numGuardPagesToAddOnEachEnd, true, kernelPage);
++}
++
++void* OSAllocator::tryReserveAndCommitImpl(size_t bytes, Usage usage, void* address, bool writable, bool executable, bool, unsigned numGuardPagesToAddOnEachEnd, bool uncommitted)
++{
++    return reserve(bytes, usage, address, writable, executable, numGuardPagesToAddOnEachEnd, !uncommitted, kernelPage);
++}
++
++void* OSAllocator::tryReserveUncommitted(size_t bytes, Usage usage, void* address, bool writable, bool executable, bool, unsigned numGuardPagesToAddOnEachEnd)
++{
++    return reserve(bytes, usage, address, writable, executable, numGuardPagesToAddOnEachEnd, false, kernelPage);
++}
++
++void* OSAllocator::reserveUncommitted(size_t bytes, Usage usage, void* address, bool writable, bool executable, bool jitCageEnabled, unsigned numGuardPagesToAddOnEachEnd)
++{
++    void* result = tryReserveUncommitted(bytes, usage, address, writable, executable, jitCageEnabled, numGuardPagesToAddOnEachEnd);
++    RELEASE_ASSERT(result);
++    return result;
++}
++
++void* OSAllocator::tryReserveUncommittedAligned(size_t bytes, size_t alignment, Usage usage, void* address, bool writable, bool executable, bool, unsigned numGuardPagesToAddOnEachEnd)
++{
++    ASSERT(hasOneBitSet(alignment) && alignment >= pageSize());
++    ASSERT_UNUSED(numGuardPagesToAddOnEachEnd, !numGuardPagesToAddOnEachEnd);
++    if (executable)
++        return nullptr;
++    return reserve(bytes, usage, address, writable, false, 0, false, alignment);
++}
++
++void* OSAllocator::reserveAndCommit(size_t bytes, Usage usage, void* address, bool writable, bool executable, bool jitCageEnabled, unsigned numGuardPagesToAddOnEachEnd)
++{
++    void* result = tryReserveAndCommit(bytes, usage, address, writable, executable, jitCageEnabled, numGuardPagesToAddOnEachEnd);
++    RELEASE_ASSERT(result);
++    return result;
++}
++
++void OSAllocator::commit(void* address, size_t bytes, bool writable, bool)
++{
++    if (!bytes || isExecutable(address))
++        return;
++    const int protection = kernelProtRead | (writable ? kernelProtWrite : 0);
++    const uintptr_t start = reinterpret_cast<uintptr_t>(address);
++    const uintptr_t begin = pageDown(start);
++    const uintptr_t end = pageUp(start + bytes);
++    if (begin == start && end == start + bytes) {
++        RELEASE_ASSERT(mapMemory(begin, end, protection, "WebKit"));
++        return;
++    }
++    // Part of a kernel page: memory only where there is none yet (another commit's data stays)
++    uintptr_t run = 0;
++    for (uintptr_t page = begin; page <= end; page += kernelPage) {
++        const bool needed = page < end && !hasMemory(page);
++        if (needed && !run)
++            run = page;
++        else if (!needed && run) {
++            RELEASE_ASSERT(mapMemory(run, page, protection, "WebKit"));
++            run = 0;
++        }
++    }
++}
++
++void OSAllocator::decommit(void* address, size_t bytes)
++{
++    if (!bytes || isExecutable(address))
++        return;
++    const uintptr_t begin = pageUp(reinterpret_cast<uintptr_t>(address));
++    const uintptr_t end = pageDown(reinterpret_cast<uintptr_t>(address) + bytes);
++    if (end > begin)
++        RELEASE_ASSERT(unmapMemory(begin, end));
++}
++
++void OSAllocator::hintMemoryNotNeededSoon(void*, size_t)
++{
++}
++
++void OSAllocator::releaseDecommitted(void* address, size_t bytes, unsigned numberOfGuardPagesOnEachEnd)
++{
++    uintptr_t begin = reinterpret_cast<uintptr_t>(address);
++    size_t size = bytes;
++    if (numberOfGuardPagesOnEachEnd) {
++        begin -= numberOfGuardPagesOnEachEnd * pageSize();
++        size += 2 * numberOfGuardPagesOnEachEnd * pageSize();
++    }
++    const uintptr_t end = pageUp(begin + size);
++    begin = pageDown(begin);
++    forgetExecutable(begin, end);
++    if (munmap(reinterpret_cast<void*>(begin), end - begin) == -1)
++        CRASH();
++}
++
++bool OSAllocator::tryProtect(void* address, size_t bytes, bool readable, bool writable)
++{
++    int protection = PROT_NONE;
++    if (readable)
++        protection = writable ? PROT_READ | PROT_WRITE : PROT_READ;
++    else
++        ASSERT(!writable);
++    return !mprotect(address, bytes, protection);
++}
++
++void OSAllocator::protect(void* address, size_t bytes, bool readable, bool writable)
++{
++    if (!tryProtect(address, bytes, readable, writable)) [[unlikely]] {
++        fprintf(stderr, "WTF::OSAllocator (PS4): mprotect %p + 0x%zx failed: %s\n", address, bytes, strerror(errno));
++        RELEASE_ASSERT_NOT_REACHED();
++    }
++}
++
++void OSAllocator::zeroFill(void* base, size_t size)
++{
++    memset(base, 0, size);
++}
++
++} // namespace WTF
+-- 
+2.53.0
+

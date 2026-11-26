@@ -1,0 +1,116 @@
+From f0d8af2ab8050083fde7dad0887f91cdcd8d490c Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Tue, 17 Nov 2026 19:11:20 +0300
+Subject: [PATCH 01/12] PS4 (Wisp): build system (OS detection, Skia expat
+ target), 16 KiB pages, app-launched processes, anonymous shm
+
+---
+ Source/ThirdParty/skia/CMakeLists.txt                  | 10 ++++++++++
+ Source/WTF/wtf/PageBlock.h                             |  2 +-
+ Source/WebCore/platform/unix/SharedMemoryUnix.cpp      |  5 ++++-
+ .../UIProcess/Launcher/glib/ProcessLauncherGLib.cpp    |  6 +++---
+ Source/cmake/WebKitCommon.cmake                        |  7 ++++++-
+ 5 files changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/Source/ThirdParty/skia/CMakeLists.txt b/Source/ThirdParty/skia/CMakeLists.txt
+index 49b92622..00a1f6c3 100644
+--- a/Source/ThirdParty/skia/CMakeLists.txt
++++ b/Source/ThirdParty/skia/CMakeLists.txt
+@@ -889,6 +889,16 @@ if (USE_SKIA_OPENTYPE_SVG)
+     if (NOT EXPAT_FOUND)
+         message(FATAL_ERROR "Expat is required by USE_SKIA_OPENTYPE_SVG")
+     endif ()
++    if (NOT TARGET EXPAT::EXPAT)
++        # PS4 (Wisp): a static expat found through its CMake package names its target expat::expat.
++        if (TARGET expat::expat)
++            add_library(EXPAT::EXPAT ALIAS expat::expat)
++        else ()
++            add_library(EXPAT::EXPAT INTERFACE IMPORTED)
++            set_target_properties(EXPAT::EXPAT PROPERTIES INTERFACE_LINK_LIBRARIES "${EXPAT_LIBRARIES}"
++                INTERFACE_INCLUDE_DIRECTORIES "${EXPAT_INCLUDE_DIRS}")
++        endif ()
++    endif ()
+ 
+     target_link_libraries(Skia PRIVATE
+         EXPAT::EXPAT
+diff --git a/Source/WTF/wtf/PageBlock.h b/Source/WTF/wtf/PageBlock.h
+index c4f9a8b1..1ae4df36 100644
+--- a/Source/WTF/wtf/PageBlock.h
++++ b/Source/WTF/wtf/PageBlock.h
+@@ -51,7 +51,7 @@ namespace WTF {
+ // aarch64 by default. USE(64KB_PAGE_BLOCK) allows overriding this.
+ //
+ // Use 64 KiB for any unknown CPUs to be conservative.
+-#if OS(DARWIN) || PLATFORM(PLAYSTATION) || CPU(MIPS) || CPU(MIPS64) || CPU(LOONGARCH64) || (OS(LINUX) && CPU(ARM64) && !USE(64KB_PAGE_BLOCK))
++#if OS(DARWIN) || PLATFORM(PLAYSTATION) || defined(__ORBIS__) || CPU(MIPS) || CPU(MIPS64) || CPU(LOONGARCH64) || (OS(LINUX) && CPU(ARM64) && !USE(64KB_PAGE_BLOCK))
+ constexpr size_t CeilingOnPageSize = 16 * KB;
+ #elif USE(64KB_PAGE_BLOCK) || CPU(PPC) || CPU(PPC64) || CPU(PPC64LE) || CPU(UNKNOWN)
+ constexpr size_t CeilingOnPageSize = 64 * KB;
+diff --git a/Source/WebCore/platform/unix/SharedMemoryUnix.cpp b/Source/WebCore/platform/unix/SharedMemoryUnix.cpp
+index c534f8fe..2dc93f87 100644
+--- a/Source/WebCore/platform/unix/SharedMemoryUnix.cpp
++++ b/Source/WebCore/platform/unix/SharedMemoryUnix.cpp
+@@ -97,7 +97,10 @@ static UnixFileDescriptor createSharedMemory()
+     }
+ #endif
+ 
+-#if HAVE(SHM_ANON)
++#if HAVE(SHM_ANON) || defined(__ORBIS__)
++#ifndef SHM_ANON
++#define SHM_ANON ((char*)1) // PS4 (Wisp): FreeBSD's anonymous shm; the musl headers lack it
++#endif
+     do {
+         fileDescriptor = shm_open(SHM_ANON, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
+     } while (fileDescriptor == -1 && errno == EINTR);
+diff --git a/Source/WebKit/UIProcess/Launcher/glib/ProcessLauncherGLib.cpp b/Source/WebKit/UIProcess/Launcher/glib/ProcessLauncherGLib.cpp
+index b20208ab..8628cd75 100644
+--- a/Source/WebKit/UIProcess/Launcher/glib/ProcessLauncherGLib.cpp
++++ b/Source/WebKit/UIProcess/Launcher/glib/ProcessLauncherGLib.cpp
+@@ -48,7 +48,7 @@
+ #include "ProcessProviderLibWPE.h"
+ #endif
+ 
+-#if OS(ANDROID)
++#if OS(ANDROID) || defined(__ORBIS__) // PS4 (Wisp): the app launches the processes (WPEProcessManager)
+ #include <wpe/wpe-platform.h>
+ #endif
+ 
+@@ -112,7 +112,7 @@ void ProcessLauncher::launchProcess()
+     IPC::SocketPair webkitSocketPair = IPC::createPlatformConnection(SOCK_SEQPACKET, connectionOptions());
+     GUniquePtr<gchar> webkitSocket(g_strdup_printf("%d", webkitSocketPair.client.value()));
+ 
+-#if OS(ANDROID)
++#if OS(ANDROID) || defined(__ORBIS__) // PS4 (Wisp): the app launches the processes (WPEProcessManager)
+     if (auto* processManager = wpe_process_manager_get_default()) {
+         WPEProcessType processType;
+         switch (m_launchOptions.processType) {
+@@ -320,7 +320,7 @@ void ProcessLauncher::terminateProcess()
+     if (!m_processID)
+         return;
+ 
+-#if OS(ANDROID)
++#if OS(ANDROID) || defined(__ORBIS__) // PS4 (Wisp): the app launches the processes (WPEProcessManager)
+     if (auto* processManager = wpe_process_manager_get_default()) {
+         wpe_process_manager_terminate(processManager, m_processID);
+         m_processID = 0;
+diff --git a/Source/cmake/WebKitCommon.cmake b/Source/cmake/WebKitCommon.cmake
+index d96e1850..6a1bceef 100644
+--- a/Source/cmake/WebKitCommon.cmake
++++ b/Source/cmake/WebKitCommon.cmake
+@@ -197,7 +197,12 @@ if (NOT HAS_RUN_WEBKIT_COMMON)
+     # -----------------------------------------------------------------------------
+     # Determine the operating system
+     # -----------------------------------------------------------------------------
+-    if (UNIX)
++    if (WISP_PS4)
++        # PS4 (Wisp): CMake's system is "Generic" (OpenOrbis toolchain); the kernel is FreeBSD 9's
++        # and the C library musl. C++ is compiled with __FreeBSD__, so WTF says OS(FREEBSD).
++        set(UNIX 1)
++        set(WTF_OS_UNIX 1)
++    elseif (UNIX)
+         if (APPLE)
+             set(WTF_OS_MACOS 1)
+         elseif (CMAKE_SYSTEM_NAME MATCHES "Linux")
+-- 
+2.53.0
+

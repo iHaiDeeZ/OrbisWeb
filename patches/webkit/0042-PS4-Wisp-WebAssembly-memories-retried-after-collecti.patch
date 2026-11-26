@@ -1,0 +1,102 @@
+From d4ec53a44f5c3d8d7c35a416c6cc8bbd4d45f011 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Wed, 25 Nov 2026 21:09:40 +0300
+Subject: [PATCH] PS4 (Wisp): WebAssembly memories retried after collecting
+ garbage
+
+On __ORBIS__ a WebAssembly memory's pages come from direct memory, and a refusal
+made Memory::tryCreate fail at once (RangeError: Out of memory): only the physical
+bytes accounting went through tryAllocate's collect-and-retry. A reload of a game
+asked for its 1 GiB while the old page's 1 GiB was still held (its garbage not yet
+collected, its threads' workers still stopping). Both PS4 paths, the reservation of
+a memory that is not shared and the first pages of a shared one, now do a full
+synchronous collection and sweep and try again, up to 4 times over about a second,
+saying so in the log.
+---
+ Source/JavaScriptCore/wasm/WasmMemory.cpp | 43 ++++++++++++++++++++---
+ 1 file changed, 38 insertions(+), 5 deletions(-)
+
+diff --git a/Source/JavaScriptCore/wasm/WasmMemory.cpp b/Source/JavaScriptCore/wasm/WasmMemory.cpp
+index 961a584f..13ad98ce 100644
+--- a/Source/JavaScriptCore/wasm/WasmMemory.cpp
++++ b/Source/JavaScriptCore/wasm/WasmMemory.cpp
+@@ -73,6 +73,27 @@ namespace {
+ 
+ constexpr bool verbose = false;
+ 
++#if defined(__ORBIS__)
++// (PS4, Wisp, v00.41) Direct memory refused for a new memory: what a page left behind may still hold it (a
++// reload's old page, its garbage not collected yet; the workers of its threads still stopping, each holding
++// the shared memory). Hot Pursuit 2's reload asked for its 1 GiB while the old page's 1 GiB was held, and
++// said "Out of memory" (v00.40). A full collection and its sweep, then the allocation again: up to 4 times
++// over about a second.
++static bool wispCollectForMemory(VM& vm, unsigned& attempt, uint64_t bytes)
++{
++    if (attempt >= 4)
++        return false;
++    if (attempt)
++        WTF::sleep(Seconds::fromMilliseconds(250));
++    ++attempt;
++    vm.heap.collectSync(CollectionScope::Full);
++    vm.heap.sweepSynchronously();
++    WTFLogAlways("WebAssembly (PS4): no direct memory for a memory of %llu MiB: garbage collected, trying again (%u of 4)",
++        static_cast<unsigned long long>(bytes >> 20), attempt);
++    return true;
++}
++#endif
++
+ NEVER_INLINE NO_RETURN_DUE_TO_CRASH void webAssemblyCouldntGetFastMemory() { CRASH(); }
+ 
+ template<typename Func>
+@@ -224,6 +245,7 @@ RefPtr<Memory> Memory::tryCreate(VM& vm, PageCount initial, PageCount maximum, M
+             return adoptRef(new Memory(initial, maximum, MemorySharingMode::Default, addressType, WTF::move(growSuccessCallback)));
+ 
+ #if defined(__ORBIS__)
++        for (unsigned wispAttempt = 0;;) {
+         // (PS4, Wisp, v00.36) Reserved to its maximum (2 GiB when it says none), memory for its initial size
+         // only: a grow then gives the new part memory in place (grow, below). A grow by copy needs the old
+         // memory and the new at once: an N64 emulator's 512 -> 758 MiB was refused (v00.35).
+@@ -239,13 +261,21 @@ RefPtr<Memory> Memory::tryCreate(VM& vm, PageCount initial, PageCount maximum, M
+                 wtf_ps4_large_commit_next(0);
+             }
+         }
+-#endif
++        if (void* slowMemory = Gigacage::tryAllocateZeroedVirtualPages(Gigacage::Primitive, initialBytes))
++            return Memory::create(adoptRef(*new BufferMemoryHandle(slowMemory, initialBytes, initialBytes, initial, maximum, MemorySharingMode::Default, MemoryMode::BoundsChecking)), addressType, WTF::move(growSuccessCallback));
++        if (!wispCollectForMemory(vm, wispAttempt, initialBytes))
++            break;
++        }
++        BufferMemoryManager::singleton().freePhysicalBytes(initialBytes);
++        return nullptr;
++#else
+         void* slowMemory = Gigacage::tryAllocateZeroedVirtualPages(Gigacage::Primitive, initialBytes);
+         if (!slowMemory) {
+             BufferMemoryManager::singleton().freePhysicalBytes(initialBytes);
+             return nullptr;
+         }
+         return Memory::create(adoptRef(*new BufferMemoryHandle(slowMemory, initialBytes, initialBytes, initial, maximum, MemorySharingMode::Default, MemoryMode::BoundsChecking)), addressType, WTF::move(growSuccessCallback));
++#endif
+     }
+     case MemorySharingMode::Shared: {
+         char* slowMemory = nullptr;
+@@ -265,10 +295,13 @@ RefPtr<Memory> Memory::tryCreate(VM& vm, PageCount initial, PageCount maximum, M
+         // now, the rest as the memory grows. JavaScriptCore checks a shared memory against its maximum, and
+         // with no fault handler here an access between its size and its maximum stops the process: only a
+         // module that reads past the end of its own memory does that.
+-        if (!wtf_ps4_commit(slowMemory, initialBytes)) {
+-            BufferMemoryManager::singleton().freeGrowableBoundsCheckingMemory(slowMemory, maximumBytes);
+-            BufferMemoryManager::singleton().freePhysicalBytes(initialBytes);
+-            return nullptr;
++        unsigned wispAttempt = 0;
++        while (!wtf_ps4_commit(slowMemory, initialBytes)) {
++            if (!wispCollectForMemory(vm, wispAttempt, initialBytes)) {
++                BufferMemoryManager::singleton().freeGrowableBoundsCheckingMemory(slowMemory, maximumBytes);
++                BufferMemoryManager::singleton().freePhysicalBytes(initialBytes);
++                return nullptr;
++            }
+         }
+ #else
+         constexpr bool readable = false;
+-- 
+2.53.0
+

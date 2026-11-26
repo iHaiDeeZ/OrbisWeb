@@ -1,0 +1,31 @@
+From b749dc57b662137a09deb63aeb50cf779f3d70d2 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Tue, 17 Nov 2026 19:59:45 +0300
+Subject: [PATCH 06/12] PS4 (Wisp): one web process for every page (7 local
+ processes, one GPU address space)
+
+---
+ Source/WebKit/UIProcess/API/glib/WebKitWebContext.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitWebContext.cpp b/Source/WebKit/UIProcess/API/glib/WebKitWebContext.cpp
+index 4c7d71e9..742367a6 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitWebContext.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitWebContext.cpp
+@@ -443,6 +443,13 @@ static void webkitWebContextConstructed(GObject* object)
+     configuration->setProcessSwapsOnNavigation(priv->psonEnabled);
+ #else
+     configuration->setProcessSwapsOnNavigation(true);
++#endif
++#if defined(__ORBIS__)
++    // PS4 (Wisp): one web process for every page. A PS4 app has 7 local processes in all and one GPU
++    // address space, which only one process at a time can hold.
++    configuration->setUsesSingleWebProcess(true);
++    configuration->setProcessSwapsOnNavigation(false);
++    configuration->setUsesWebProcessCache(false);
+ #endif
+     if (priv->memoryPressureSettings) {
+         configuration->setMemoryPressureHandlerConfiguration(webkitMemoryPressureSettingsGetMemoryPressureHandlerConfiguration(priv->memoryPressureSettings));
+-- 
+2.53.0
+

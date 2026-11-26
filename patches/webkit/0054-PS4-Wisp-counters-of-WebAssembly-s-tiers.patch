@@ -1,0 +1,181 @@
+From 1bdaefb589d6292c61cfdc12664b001192ac551d Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Thu, 26 Nov 2026 17:44:23 +0300
+Subject: [PATCH] PS4 (Wisp): counters of WebAssembly's tiers
+
+Mortal Kombat's game thread (one worker at 100% of its core, v00.44's
+profile) still spent part of its time in IPInt, WebAssembly's interpreter,
+minutes into a fight, with its compiled code spread over 48 of the JIT's
+64 MiB. Nothing said whether functions failed to compile (out of executable
+memory: LinkBuffer::didFailToAllocate), or stayed on BBQ because they are
+larger than maximumOMGCandidateCost.
+
+wisp_jit_counters (WTF/wtf/ps4/MemoryPS4.cpp): functions BBQ compiled, BBQ out
+of executable memory, BBQ failed otherwise, OMG compiled, OMG out of
+executable memory, OMG failed otherwise, functions BBQ compiled that are too
+large for OMG, and the largest of those. wisp_jit_code_bytes() (C linkage,
+ExecutableAllocator.cpp): JIT code in use and the region's size. The web
+process logs them every 10 s.
+---
+ .../jit/ExecutableAllocator.cpp               | 18 +++++++++++++
+ Source/JavaScriptCore/wasm/WasmBBQPlan.cpp    | 26 +++++++++++++++++++
+ Source/JavaScriptCore/wasm/WasmOMGPlan.cpp    | 18 +++++++++++++
+ Source/WTF/wtf/ps4/MemoryPS4.cpp              |  5 ++++
+ 4 files changed, 67 insertions(+)
+
+diff --git a/Source/JavaScriptCore/jit/ExecutableAllocator.cpp b/Source/JavaScriptCore/jit/ExecutableAllocator.cpp
+index bba3eeab..91ecd8b9 100644
+--- a/Source/JavaScriptCore/jit/ExecutableAllocator.cpp
++++ b/Source/JavaScriptCore/jit/ExecutableAllocator.cpp
+@@ -1252,6 +1252,24 @@ Lock& ExecutableAllocator::getLock() const
+     return allocator->getLock();
+ }
+ 
++#if defined(__ORBIS__)
++// PS4 (Wisp): JIT code in use and the region it comes from, for the web process's log (C linkage: the app
++// reads it)
++extern "C" size_t wisp_jit_code_bytes(size_t* region)
++{
++#if !ENABLE(LIBPAS_JIT_HEAP)
++    if (FixedVMPoolExecutableAllocator* allocator = g_jscConfig.fixedVMPoolExecutableAllocator) {
++        if (region)
++            *region = allocator->bytesReserved();
++        return allocator->bytesAllocated();
++    }
++#endif
++    if (region)
++        *region = 0;
++    return 0;
++}
++#endif
++
+ size_t ExecutableAllocator::committedByteCount()
+ {
+ #if ENABLE(LIBPAS_JIT_HEAP)
+diff --git a/Source/JavaScriptCore/wasm/WasmBBQPlan.cpp b/Source/JavaScriptCore/wasm/WasmBBQPlan.cpp
+index d3a52d7b..6a34da12 100644
+--- a/Source/JavaScriptCore/wasm/WasmBBQPlan.cpp
++++ b/Source/JavaScriptCore/wasm/WasmBBQPlan.cpp
+@@ -45,6 +45,15 @@
+ #include <wtf/StdLibExtras.h>
+ #include <wtf/text/MakeString.h>
+ 
++#if defined(__ORBIS__)
++// PS4 (Wisp): counted for the web process's log (WTF/wtf/ps4/MemoryPS4.cpp: wisp_jit_counters)
++extern "C" unsigned long long wisp_jit_counters[8];
++static inline void wispCountJIT(unsigned slot, unsigned long long amount = 1)
++{
++    __atomic_fetch_add(&wisp_jit_counters[slot], amount, __ATOMIC_RELAXED);
++}
++#endif
++
+ namespace JSC { namespace Wasm {
+ 
+ namespace WasmBBQPlanInternal {
+@@ -101,6 +110,9 @@ void BBQPlan::work()
+ 
+     LinkBuffer linkBuffer(*context.wasmEntrypointJIT, callee.ptr(), LinkBuffer::Profile::WasmBBQ, JITCompilationCanFail);
+     if (linkBuffer.didFailToAllocate()) [[unlikely]] {
++#if defined(__ORBIS__)
++        wispCountJIT(1);
++#endif
+         fail(makeString("Out of executable memory while tiering up function at index "_s, m_functionIndex.rawIndex()), CompilationError::OutOfMemory);
+         return;
+     }
+@@ -141,6 +153,17 @@ void BBQPlan::work()
+         }
+     }
+ 
++#if defined(__ORBIS__)
++    wispCountJIT(0);
++    if (Options::useOMGJIT()) {
++        const size_t size = m_moduleInformation->functions[m_functionIndex].data.size();
++        if (size > Options::maximumOMGCandidateCost()) {
++            wispCountJIT(6);
++            unsigned long long largest = __atomic_load_n(&wisp_jit_counters[7], __ATOMIC_RELAXED);
++            while (size > largest && !__atomic_compare_exchange_n(&wisp_jit_counters[7], &largest, static_cast<unsigned long long>(size), false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
++        }
++    }
++#endif
+     dataLogLnIf(WasmBBQPlanInternal::verbose, "Finished BBQ ", m_functionIndex);
+ 
+     Locker locker { m_lock };
+@@ -162,6 +185,9 @@ std::unique_ptr<InternalFunction> BBQPlan::compileFunction(FunctionCodeIndex fun
+     endCompilerSignpost(callee);
+ 
+     if (!parseAndCompileResult) [[unlikely]] {
++#if defined(__ORBIS__)
++        wispCountJIT(2);
++#endif
+         fail(makeString(parseAndCompileResult.error(), ", in function at index "_s, functionIndex.rawIndex()), CompilationError::Parse); // FIXME: make this an Expected.
+         return nullptr;
+     }
+diff --git a/Source/JavaScriptCore/wasm/WasmOMGPlan.cpp b/Source/JavaScriptCore/wasm/WasmOMGPlan.cpp
+index 03134113..09f9006a 100644
+--- a/Source/JavaScriptCore/wasm/WasmOMGPlan.cpp
++++ b/Source/JavaScriptCore/wasm/WasmOMGPlan.cpp
+@@ -44,6 +44,15 @@
+ #include <wtf/StdLibExtras.h>
+ #include <wtf/text/MakeString.h>
+ 
++#if defined(__ORBIS__)
++// PS4 (Wisp): counted for the web process's log (WTF/wtf/ps4/MemoryPS4.cpp: wisp_jit_counters)
++extern "C" unsigned long long wisp_jit_counters[8];
++static inline void wispCountJIT(unsigned slot, unsigned long long amount = 1)
++{
++    __atomic_fetch_add(&wisp_jit_counters[slot], amount, __ATOMIC_RELAXED);
++}
++#endif
++
+ namespace JSC { namespace Wasm {
+ 
+ namespace WasmOMGPlanInternal {
+@@ -140,6 +149,9 @@ void OMGPlan::work()
+     endCompilerSignpost(callee.get());
+ 
+     if (!parseAndCompileResult) [[unlikely]] {
++#if defined(__ORBIS__)
++        wispCountJIT(5);
++#endif
+         Locker locker { m_lock };
+         fail(makeString(parseAndCompileResult.error(), "when trying to tier up "_s, m_functionIndex.rawIndex()), CompilationError::Parse);
+         return;
+@@ -148,6 +160,9 @@ void OMGPlan::work()
+     Entrypoint omgEntrypoint;
+     LinkBuffer linkBuffer(*context.wasmEntrypointJIT, callee.ptr(), LinkBuffer::Profile::WasmOMG, JITCompilationCanFail);
+     if (linkBuffer.didFailToAllocate()) [[unlikely]] {
++#if defined(__ORBIS__)
++        wispCountJIT(4);
++#endif
+         Locker locker { m_lock };
+         Base::fail(makeString("Out of executable memory while tiering up function at index "_s, m_functionIndex.rawIndex()), CompilationError::OutOfMemory);
+         return;
+@@ -202,6 +217,9 @@ void OMGPlan::work()
+         }
+     }
+ 
++#if defined(__ORBIS__)
++    wispCountJIT(3);
++#endif
+     dataLogLnIf(WasmOMGPlanInternal::verbose, "Finished OMG ", m_functionIndex);
+     Locker locker { m_lock };
+     complete();
+diff --git a/Source/WTF/wtf/ps4/MemoryPS4.cpp b/Source/WTF/wtf/ps4/MemoryPS4.cpp
+index 1a2208eb..9fdbc0d5 100644
+--- a/Source/WTF/wtf/ps4/MemoryPS4.cpp
++++ b/Source/WTF/wtf/ps4/MemoryPS4.cpp
+@@ -28,6 +28,11 @@ extern "C" {
+ // [4] WebGPU canvas frames presented, [5] those dropped (the GPU two frames behind), [6] those shown (read
+ // back), [7] canvas textures made (WebGPUPresentationContextImpl). Atomic adds, relaxed.
+ unsigned long long wisp_frame_counters[8];
++// (v00.45) WebAssembly's tiers (JavaScriptCore: WasmBBQPlan.cpp, WasmOMGPlan.cpp): [0] functions BBQ compiled,
++// [1] BBQ out of executable memory, [2] BBQ failed otherwise, [3] OMG compiled, [4] OMG out of executable memory,
++// [5] OMG failed otherwise, [6] functions BBQ compiled that are too large for OMG (maximumOMGCandidateCost),
++// [7] the largest of those, in bytes
++unsigned long long wisp_jit_counters[8];
+ 
+ __attribute__((weak)) size_t wisp_memory_footprint(void)
+ {
+-- 
+2.53.0
+

@@ -1,0 +1,27 @@
+From 050d97ded6e84b58b35a7def872ffa25c7996116 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Tue, 17 Nov 2026 19:11:38 +0300
+Subject: [PATCH 02/12] PS4 (Wisp): libWPEWebKit static
+
+---
+ Source/cmake/OptionsWPE.cmake | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/Source/cmake/OptionsWPE.cmake b/Source/cmake/OptionsWPE.cmake
+index 10746b1c..c7fae02f 100644
+--- a/Source/cmake/OptionsWPE.cmake
++++ b/Source/cmake/OptionsWPE.cmake
+@@ -203,6 +203,10 @@ set(bmalloc_LIBRARY_TYPE OBJECT)
+ set(WTF_LIBRARY_TYPE OBJECT)
+ set(JavaScriptCore_LIBRARY_TYPE OBJECT)
+ set(WebCore_LIBRARY_TYPE OBJECT)
++if (WISP_PS4)
++    # PS4 (Wisp): no shared libraries; the app's three processes link libWPEWebKit-2.0.a.
++    set(WebKit_LIBRARY_TYPE STATIC)
++endif ()
+ 
+ # These are shared variables, but we special case their definition so that we can use the
+ # CMAKE_INSTALL_* variables that are populated by the GNUInstallDirs macro.
+-- 
+2.53.0
+

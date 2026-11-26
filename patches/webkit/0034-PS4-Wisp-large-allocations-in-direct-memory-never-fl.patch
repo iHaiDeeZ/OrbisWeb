@@ -1,0 +1,238 @@
+From b72065aa49e22302e3ad23cb8b16dd626d41c45d Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Wed, 25 Nov 2026 12:33:02 +0300
+Subject: [PATCH] PS4 (Wisp): large allocations in direct memory, never
+ flexible memory
+
+bmalloc's large allocations (SystemHeap::memalignLarge: every WebAssembly memory that is not shared,
+each grow's new copy, other large zeroed virtual allocations) went through tryVMAllocate's mmap to the
+kit's, which takes large anonymous mappings from the system flexible memory pool. The kernel keeps its
+own objects there too (pthread mutexes and conditions, "ScePthread internal memory"): an N64 emulator's
+512 MiB WebAssembly memory left none for them, pthread_cond_init failed with ENOMEM, and the PS4 ended
+the whole app.
+
+On __ORBIS__ they are now reservations with direct memory in them, from WTF's direct memory pool
+(wtf_ps4_large_allocate / wtf_ps4_large_free in OSAllocatorPS4.cpp), and only direct memory: when there
+is not enough the allocation fails (JavaScript gets a RangeError) instead of taking flexible memory.
+bmalloc still clears them (the pool's pages are not cleared twice). tryVMAllocate stays for a console
+without usable direct memory.
+
+wtf_ps4_commit (the commits of growable buffers: shared WebAssembly memories, resizable and growable
+ArrayBuffers) takes direct memory only too when direct memory works; other commits keep the flexible
+memory fallback. A refused buffer is said in the log (the first few times) and the kernel is asked for
+blocks again at the next commit.
+---
+ Source/WTF/wtf/ps4/OSAllocatorPS4.cpp | 92 ++++++++++++++++++++++++---
+ Source/bmalloc/bmalloc/SystemHeap.cpp | 23 +++++++
+ 2 files changed, 105 insertions(+), 10 deletions(-)
+
+diff --git a/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp b/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp
+index 2f3aec24..c03019f2 100644
+--- a/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp
++++ b/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp
+@@ -385,8 +385,9 @@ bool useDirectMemory()
+     return wanted && !directMemoryRefused.load(std::memory_order_relaxed);
+ }
+ 
+-// Direct memory over [begin, end) (kernel pages), cleared as flexible memory comes: how far it got
+-uintptr_t mapDirectMemory(uintptr_t begin, uintptr_t end, int protection, const char* name)
++// Direct memory over [begin, end) (kernel pages), cleared as flexible memory comes (unless the caller
++// clears it itself): how far it got
++uintptr_t mapDirectMemory(uintptr_t begin, uintptr_t end, int protection, const char* name, bool clear = true)
+ {
+     uintptr_t at = begin;
+     while (at < end) {
+@@ -405,12 +406,29 @@ uintptr_t mapDirectMemory(uintptr_t begin, uintptr_t end, int protection, const
+             break;
+         }
+         // (the kernel does not clear direct memory, and the pool's pages hold what they held last)
+-        memset(address, 0, bytes);
++        if (clear)
++            memset(address, 0, bytes);
+         at += bytes;
+     }
+     return at;
+ }
+ 
++// A large buffer direct memory could not hold (it is refused rather than taken from flexible memory):
++// said in the log (the first few times) with what the pool holds, and the kernel asked for blocks again at once
++void noteBuffersRefused(size_t bytes)
++{
++    static std::atomic<unsigned> notes { 0 };
++    size_t held = 0;
++    {
++        Locker locker { poolLock };
++        held = static_cast<size_t>(blockCount) * blockSize;
++        blockRetryIn = 0;
++    }
++    if (notes.fetch_add(1, std::memory_order_relaxed) < 4)
++        fprintf(stderr, "WTF::OSAllocator (PS4): no direct memory for a buffer of %zu MiB (WebKit's pages hold %zu MiB): refused, not taken from flexible memory\n",
++            bytes >> 20, held >> 20);
++}
++
+ // Address space only over [begin, end) again (kernel pages)
+ bool reserveAgain(uintptr_t begin, uintptr_t end)
+ {
+@@ -458,14 +476,22 @@ bool returnDirectMemory(uintptr_t begin, uintptr_t end)
+ }
+ 
+ // Memory over [begin, end) (kernel pages), replacing the reservation there: direct memory, flexible
+-// memory for what direct memory did not cover
+-bool mapMemory(uintptr_t begin, uintptr_t end, int protection, const char* name)
++// memory for what direct memory did not cover (unless `flexibleToo` is false and direct memory works:
++// JavaScript's large buffers, see wtf_ps4_commit)
++bool mapMemory(uintptr_t begin, uintptr_t end, int protection, const char* name, bool flexibleToo = true)
+ {
+     const uintptr_t start = begin;
+-    if (useDirectMemory())
++    const bool direct = useDirectMemory();
++    if (direct)
+         begin = mapDirectMemory(begin, end, protection, name);
+     if (begin == end)
+         return true;
++    if (direct && !flexibleToo) {
++        if (begin > start && !returnDirectMemory(start, begin))
++            reserveAgain(start, begin);
++        noteBuffersRefused(end - start);
++        return false;
++    }
+     void* address = reinterpret_cast<void*>(begin);
+     const size_t bytes = end - begin;
+     int result = sceKernelMapNamedSystemFlexibleMemory(&address, bytes, protection, kernelMapFixed, name);
+@@ -614,7 +640,7 @@ void* OSAllocator::reserveAndCommit(size_t bytes, Usage usage, void* address, bo
+ namespace {
+ 
+ // Memory over [address, address + bytes): false when there was none left (what got mapped stays)
+-bool commitRange(void* address, size_t bytes, int protection, const char* name)
++bool commitRange(void* address, size_t bytes, int protection, const char* name, bool flexibleToo = true)
+ {
+     if (!bytes || isExecutable(address))
+         return true;
+@@ -622,7 +648,7 @@ bool commitRange(void* address, size_t bytes, int protection, const char* name)
+     const uintptr_t begin = pageDown(start);
+     const uintptr_t end = pageUp(start + bytes);
+     if (begin == start && end == start + bytes)
+-        return mapMemory(begin, end, protection, name);
++        return mapMemory(begin, end, protection, name, flexibleToo);
+     // Part of a kernel page: memory only where there is none yet (another commit's data stays)
+     uintptr_t run = 0;
+     for (uintptr_t page = begin; page <= end; page += kernelPage) {
+@@ -630,7 +656,7 @@ bool commitRange(void* address, size_t bytes, int protection, const char* name)
+         if (needed && !run)
+             run = page;
+         else if (!needed && run) {
+-            if (!mapMemory(run, page, protection, name))
++            if (!mapMemory(run, page, protection, name, flexibleToo))
+                 return false;
+             run = 0;
+         }
+@@ -713,9 +739,55 @@ extern "C" size_t wtf_ps4_page_memory(size_t* held)
+ // JavaScriptCore's growable buffers (WebAssembly's shared memories, resizable and growable ArrayBuffers:
+ // runtime/BufferMemoryHandle.cpp, ArrayBuffer.cpp, wasm/WasmMemory.cpp) are reservations, address space
+ // only; the part in use gets memory here as a buffer grows. False when there is no memory left for it.
++// (v00.35) Direct memory only when direct memory works: flexible memory is the kernel's (its system pool
++// holds the kernel's own objects; a large buffer there can leave it none, and the PS4 ends the app) or the
++// app's processes' (their shared pool: an empty one freezes the app). A grow that does not fit fails.
+ extern "C" bool wtf_ps4_commit(void* address, size_t bytes)
+ {
+-    return commitRange(address, bytes, kernelProtRead | kernelProtWrite, "WebKit buffers");
++    return commitRange(address, bytes, kernelProtRead | kernelProtWrite, "WebKit buffers", false);
++}
++
++// bmalloc's large allocations (bmalloc/SystemHeap.cpp memalignLarge: WebAssembly memories that are not
++// shared, each grow's new copy, other large zeroed buffers): a reservation with direct memory in it, not
++// cleared (bmalloc clears it), and only direct memory. `handled` false: no usable direct memory on this
++// console, and the caller maps memory its own way.
++extern "C" void* wtf_ps4_large_allocate(size_t bytes, size_t alignment, bool* handled)
++{
++    *handled = useDirectMemory();
++    if (!*handled)
++        return nullptr;
++    bytes = pageUp(bytes);
++    auto* base = static_cast<uint8_t*>(reserveRange(bytes, std::max<size_t>(alignment, kernelPage), nullptr));
++    if (!base)
++        return nullptr;
++    const uintptr_t begin = reinterpret_cast<uintptr_t>(base);
++    const uintptr_t end = begin + bytes;
++    {
++        // (a commit that found the kernel out of blocks earlier makes the next ones skip asking: not this one)
++        Locker locker { poolLock };
++        blockRetryIn = 0;
++    }
++    const uintptr_t reached = mapDirectMemory(begin, end, kernelProtRead | kernelProtWrite, "WebKit buffers", false);
++    if (reached != end) {
++        if (reached > begin)
++            returnDirectMemory(begin, reached);
++        sceKernelMunmap(base, bytes);
++        noteBuffersRefused(bytes);
++        return nullptr;
++    }
++    return base;
++}
++
++// One of those back: its direct memory to the pool, then the range unmapped (also right for memory the
++// kit's mmap gave, when direct memory was not usable)
++extern "C" void wtf_ps4_large_free(void* address, size_t bytes)
++{
++    const uintptr_t begin = pageDown(reinterpret_cast<uintptr_t>(address));
++    const uintptr_t end = pageUp(reinterpret_cast<uintptr_t>(address) + bytes);
++    if (pagesInUse.load(std::memory_order_relaxed))
++        returnDirectMemory(begin, end);
++    if (munmap(reinterpret_cast<void*>(begin), end - begin) == -1)
++        CRASH();
+ }
+ 
+ } // namespace WTF
+diff --git a/Source/bmalloc/bmalloc/SystemHeap.cpp b/Source/bmalloc/bmalloc/SystemHeap.cpp
+index 6e43575c..830aa1a1 100644
+--- a/Source/bmalloc/bmalloc/SystemHeap.cpp
++++ b/Source/bmalloc/bmalloc/SystemHeap.cpp
+@@ -37,6 +37,12 @@
+ #include "pas_system_heap.h"
+ #endif
+ 
++#if defined(__ORBIS__)
++// (PS4, Wisp) WTF/wtf/ps4/OSAllocatorPS4.cpp
++extern "C" void* wtf_ps4_large_allocate(size_t bytes, size_t alignment, bool* handled);
++extern "C" void wtf_ps4_large_free(void* address, size_t bytes);
++#endif
++
+ namespace bmalloc {
+ 
+ SystemHeap* systemHeapCache { nullptr };
+@@ -208,7 +214,19 @@ void* SystemHeap::memalignLarge(size_t alignment, size_t size)
+ {
+     alignment = roundUpToMultipleOf(m_pageSize, alignment);
+     size = roundUpToMultipleOf(m_pageSize, size);
++#if defined(__ORBIS__)
++    // (PS4, Wisp) Direct memory (WebAssembly memories, each grow's new copy, other large zeroed buffers):
++    // tryVMAllocate's mmap went to the kit's, which takes large mappings from the system flexible memory
++    // pool, where the kernel keeps its own objects; a game's 512 MiB WebAssembly memory left none for
++    // them and the PS4 ended the whole app (Wisp v00.34). tryVMAllocate stays for a console without
++    // usable direct memory.
++    bool handled = false;
++    void* result = wtf_ps4_large_allocate(size, alignment, &handled);
++    if (!handled)
++        result = tryVMAllocate(alignment, size);
++#else
+     void* result = tryVMAllocate(alignment, size);
++#endif
+     if (!result)
+         return nullptr;
+     {
+@@ -231,7 +249,12 @@ void SystemHeap::freeLarge(void* base)
+         RELEASE_BASSERT(numErased == 1);
+     }
+ 
++#if defined(__ORBIS__)
++    // (PS4, Wisp) its direct memory back to the pool, then the range unmapped (an mmap'd one: unmapped only)
++    wtf_ps4_large_free(base, size);
++#else
+     vmDeallocate(base, size);
++#endif
+ }
+ 
+ SystemHeap* SystemHeap::tryGetSlow()
+-- 
+2.53.0
+

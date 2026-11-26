@@ -1,0 +1,106 @@
+From a40eab44815945fdaa849c2c4fba50c3e354dd51 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Thu, 26 Nov 2026 16:37:25 +0300
+Subject: [PATCH] PS4 (Wisp): an AudioContext's worklet thread ends with its
+ page
+
+Upstream stops an AudioWorklet's thread only when its BaseAudioContext is
+destroyed (~AudioWorkletMessagingProxy). A stopped context lives on while a
+node is still connected to its destination: every node holds the context, and
+the connections hold the nodes. On Apple's systems a tab's process ends with
+the tab, so this never shows. In OrbisWeb's single web process the worklet's
+thread and its script stayed for good, and a game's AudioWorkletProcessor
+holds the game's shared WebAssembly memory (its sound ring): Hot Pursuit 2
+left two worklet threads alive 30 s after its tab closed, with 2 GiB of direct
+memory, and the next game (or the next canvas texture) got none.
+
+BaseAudioContext::stop() (the page being torn down) now stops the worklet's
+thread after uninitialize(): its global scope's script is cleared on that
+thread (clearScript), so its VM and every object in it go, whatever still
+holds the C++ objects. WISP_WORKLET_STOP=0 leaves it to upstream. Also a count
+of live contexts for the held-memory report.
+---
+ .../Modules/webaudio/BaseAudioContext.cpp     | 46 +++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/Source/WebCore/Modules/webaudio/BaseAudioContext.cpp b/Source/WebCore/Modules/webaudio/BaseAudioContext.cpp
+index 653decd1..e40a3d8f 100644
+--- a/Source/WebCore/Modules/webaudio/BaseAudioContext.cpp
++++ b/Source/WebCore/Modules/webaudio/BaseAudioContext.cpp
+@@ -42,6 +42,12 @@
+ #include "AudioParamDescriptor.h"
+ #include "AudioSession.h"
+ #include "AudioWorklet.h"
++#if defined(__ORBIS__)
++#include "AudioWorkletMessagingProxy.h"
++#include "AudioWorkletThread.h"
++#include <cstdlib>
++#include <cstring>
++#endif
+ #include "BiquadFilterNode.h"
+ #include "ChannelMergerNode.h"
+ #include "ChannelMergerOptions.h"
+@@ -174,6 +180,14 @@ bool BaseAudioContext::isContextAlive(uint64_t contextID)
+     return liveAudioContexts().contains(contextID);
+ }
+ 
++#if defined(__ORBIS__)
++// PS4 (Wisp): for the report after a page leaves (page/MemoryRelease.cpp)
++size_t wispLiveAudioContextCount()
++{
++    return liveAudioContexts().size();
++}
++#endif
++
+ void BaseAudioContext::lazyInitialize()
+ {
+     if (isStopped() || isClosed())
+@@ -269,6 +283,34 @@ void BaseAudioContext::setState(State state)
+         promise.resolve();
+ }
+ 
++#if defined(__ORBIS__)
++// PS4 (Wisp): the AudioWorklet's thread ends with the context's page. Upstream stops it only when the
++// context itself is destroyed (~AudioWorkletMessagingProxy), and a stopped context lives on while a node is
++// still connected to its destination (each node holds the context; the connections hold the nodes). On
++// Apple's systems the tab's process ends with the tab, so that never shows; in OrbisWeb's one web process
++// the worklet's thread and its script stayed for good: a game's AudioWorkletProcessor holds the game's
++// shared WebAssembly memory (its sound ring), so 1-2 GiB of direct memory stayed taken after the page
++// closed (Hot Pursuit 2, v00.43: two worklet threads alive 30 s after its tab closed; the next game got no
++// memory). Stopping the thread clears its global scope's script (clearScript): its VM and every object in it
++// go, whatever still holds the C++ objects. WISP_WORKLET_STOP=0 leaves it to upstream.
++static void wispStopWorkletThread(AudioWorklet& worklet)
++{
++    static const bool enabled = [] {
++        const char* value = getenv("WISP_WORKLET_STOP");
++        return !value || strcmp(value, "0");
++    }();
++    if (!enabled)
++        return;
++    CheckedPtr proxy = worklet.proxy();
++    if (!proxy)
++        return;
++    static unsigned notes = 0;
++    if (notes++ < 8)
++        WTFLogAlways("Web Audio (PS4): a stopped page's AudioWorklet thread ends (its script and what it held go)");
++    proxy->workletThread().stop();
++}
++#endif
++
+ void BaseAudioContext::stop()
+ {
+     ASSERT(isMainThread());
+@@ -287,6 +329,10 @@ void BaseAudioContext::stop()
+ 
+     uninitialize();
+     clear();
++#if defined(__ORBIS__)
++    // (after uninitialize(): the destination stopped rendering, so the worklet thread runs no process() now)
++    wispStopWorkletThread(m_worklet.get());
++#endif
+ }
+ 
+ Document* BaseAudioContext::document() const
+-- 
+2.53.0
+

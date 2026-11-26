@@ -1,0 +1,88 @@
+From 372bf397483dc410a3ff1384e8f6204de0f3e4f4 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Fri, 20 Nov 2026 04:42:51 +0300
+Subject: [PATCH] PS4 (Wisp): glyphs the font moves up or down are drawn there
+ (Arabic vowel marks, Naskh joins)
+
+Skia's text blob for horizontal text had x positions only, so every glyph sat at y 0: the vertical
+offsets HarfBuzz gives (GPOS mark positioning: Arabic's harakat, Naskh's stepped joins, Indic marks)
+were dropped. Marks sat on the letters' dots (a damma over teh read as theh) and words whose letters
+step vertically came apart. A run with any vertical offset now gets x and y positions. And
+HarfBuzz's offsets (up) were stored as the glyph buffer's (down: the context's coordinates, as
+FontCascadeCoreText.cpp takes its positions) unturned, which the dropped y hid: horizontal text's are
+turned over now (vertical text keeps upstream's handling).
+---
+ .../skia/ComplexTextControllerSkia.cpp        |  5 ++++
+ .../platform/graphics/skia/FontSkia.cpp       | 23 ++++++++++++++++---
+ 2 files changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/Source/WebCore/platform/graphics/skia/ComplexTextControllerSkia.cpp b/Source/WebCore/platform/graphics/skia/ComplexTextControllerSkia.cpp
+index f2f07345..4e087e22 100644
+--- a/Source/WebCore/platform/graphics/skia/ComplexTextControllerSkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/ComplexTextControllerSkia.cpp
+@@ -80,6 +80,11 @@ ComplexTextController::ComplexTextRun::ComplexTextRun(hb_buffer_t* buffer, const
+ 
+         float offsetX = harfBuzzPositionToFloat(glyphPositions[i].x_offset);
+         float offsetY = harfBuzzPositionToFloat(glyphPositions[i].y_offset);
++        // PS4 (Wisp): HarfBuzz's offsets go up, the glyph buffer's go down (they are in the context's
++        // coordinates, as FontCascadeCoreText.cpp says of its positions): horizontal text's turned over
++        // (vertical text keeps upstream's handling)
++        if (m_font->platformData().orientation() == FontOrientation::Horizontal)
++            offsetY = -offsetY;
+         float advanceX = harfBuzzPositionToFloat(glyphPositions[i].x_advance);
+         float advanceY = harfBuzzPositionToFloat(glyphPositions[i].y_advance);
+ 
+diff --git a/Source/WebCore/platform/graphics/skia/FontSkia.cpp b/Source/WebCore/platform/graphics/skia/FontSkia.cpp
+index d24902bb..989f4de6 100644
+--- a/Source/WebCore/platform/graphics/skia/FontSkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/FontSkia.cpp
+@@ -229,19 +229,32 @@ sk_sp<SkTextBlob> Font::buildTextBlob(std::span<const GlyphBufferGlyph> glyphs,
+     const auto& font = m_platformData.skFont();
+     auto edging = allowsAntialiasing() ? edgingForFontSmoothingMode(font, smoothingMode) : SkFont::Edging::kAlias;
+     bool isVertical = m_platformData.orientation() == FontOrientation::Vertical;
++    // PS4 (Wisp): horizontal text whose glyphs the font moves up or down (GPOS: Arabic's vowel marks,
++    // Naskh's stepped joins, Indic marks) gets x and y positions; upstream drew every glyph at y 0, so
++    // marks sat on the letters' dots and stepped joins came apart
++    bool hasVerticalOffsets = false;
++    if (!isVertical) {
++        for (const auto& advance : advances) {
++            if (advance.height()) {
++                hasVerticalOffsets = true;
++                break;
++            }
++        }
++    }
++    bool withYPositions = isVertical || hasVerticalOffsets;
+ 
+     SkTextBlobBuilder builder;
+     const auto& buffer = [&]() {
+         if (font.getEdging() == edging)
+-            return isVertical ? builder.allocRunPos(font, glyphs.size()) : builder.allocRunPosH(font, glyphs.size(), 0);
++            return withYPositions ? builder.allocRunPos(font, glyphs.size()) : builder.allocRunPosH(font, glyphs.size(), 0);
+ 
+         SkFont copiedFont = font;
+         copiedFont.setEdging(edging);
+-        return isVertical ? builder.allocRunPos(copiedFont, glyphs.size()) : builder.allocRunPosH(copiedFont, glyphs.size(), 0);
++        return withYPositions ? builder.allocRunPos(copiedFont, glyphs.size()) : builder.allocRunPosH(copiedFont, glyphs.size(), 0);
+     }();
+ 
+     auto bufferGlyphs = unsafeMakeSpan<SkGlyphID>(buffer.glyphs, glyphs.size());
+-    auto bufferPositions = unsafeMakeSpan<SkScalar>(buffer.pos, glyphs.size() * (isVertical ? 2 : 1));
++    auto bufferPositions = unsafeMakeSpan<SkScalar>(buffer.pos, glyphs.size() * (withYPositions ? 2 : 1));
+ 
+     FloatSize glyphPosition;
+     for (size_t i = 0; i < glyphs.size(); ++i) {
+@@ -251,6 +264,10 @@ sk_sp<SkTextBlob> Font::buildTextBlob(std::span<const GlyphBufferGlyph> glyphs,
+             glyphPosition += advances[i];
+             bufferPositions[2 * i] = glyphPosition.height();
+             bufferPositions[2 * i + 1] = glyphPosition.width();
++        } else if (hasVerticalOffsets) {
++            bufferPositions[2 * i] = glyphPosition.width();
++            bufferPositions[2 * i + 1] = glyphPosition.height();
++            glyphPosition += advances[i];
+         } else {
+             bufferPositions[i] = glyphPosition.width();
+             glyphPosition += advances[i];
+-- 
+2.53.0
+

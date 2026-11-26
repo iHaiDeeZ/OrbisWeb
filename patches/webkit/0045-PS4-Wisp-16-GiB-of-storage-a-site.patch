@@ -1,0 +1,66 @@
+From bec4c8520f28b23ab61e355b0ab19b893a8fba81 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Wed, 25 Nov 2026 22:12:01 +0300
+Subject: [PATCH] PS4 (Wisp): 16 GiB of storage a site
+
+WPE sets no ratio of the volume for the origin quota, so every site had the fixed
+default of 1000 MB, and nothing answers a page's request for more: a game caching its
+disc in the origin-private file system stopped at QuotaExceededError. On __ORBIS__
+WebsiteDataStoreConfiguration gives each origin 16 GiB.
+---
+ .../WebsiteDataStoreConfiguration.cpp          | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/Source/WebKit/UIProcess/WebsiteData/WebsiteDataStoreConfiguration.cpp b/Source/WebKit/UIProcess/WebsiteData/WebsiteDataStoreConfiguration.cpp
+index 9961b2bd..c5947cd6 100644
+--- a/Source/WebKit/UIProcess/WebsiteData/WebsiteDataStoreConfiguration.cpp
++++ b/Source/WebKit/UIProcess/WebsiteData/WebsiteDataStoreConfiguration.cpp
+@@ -33,6 +33,18 @@
+ 
+ namespace WebKit {
+ 
++// PS4 (Wisp): 16 GiB a site. WPE sets no ratio of the disk, so a site had the fixed 1000 MB, and nothing
++// answers its requests for more: Midnight Club 3's disc cache stopped at QuotaExceededError (v00.41), and a
++// game's disc image alone can be larger. The PS4's /data has hundreds of GiB.
++static uint64_t wispPerOriginStorageQuota()
++{
++#if defined(__ORBIS__)
++    return static_cast<uint64_t>(16) << 30;
++#else
++    return WebsiteDataStore::defaultPerOriginQuota();
++#endif
++}
++
+ TimeBasedEvictionMode WebsiteDataStoreConfiguration::defaultTimeBasedEvictionMode()
+ {
+ #if ENABLE(TIME_BASED_EVICTION_SERVICE_WORKER_ONLY)
+@@ -45,7 +57,7 @@ TimeBasedEvictionMode WebsiteDataStoreConfiguration::defaultTimeBasedEvictionMod
+ WebsiteDataStoreConfiguration::WebsiteDataStoreConfiguration(IsPersistent isPersistent, ShouldInitializePaths shouldInitializePaths)
+     : m_isPersistent(isPersistent)
+     , m_unifiedOriginStorageLevel(WebsiteDataStore::defaultUnifiedOriginStorageLevel())
+-    , m_perOriginStorageQuota(WebsiteDataStore::defaultPerOriginQuota())
++    , m_perOriginStorageQuota(wispPerOriginStorageQuota())
+     , m_originQuotaRatio(WebsiteDataStore::defaultOriginQuotaRatio())
+     , m_totalQuotaRatio(WebsiteDataStore::defaultTotalQuotaRatio())
+     , m_standardVolumeCapacity(WebsiteDataStore::defaultStandardVolumeCapacity())
+@@ -74,7 +86,7 @@ WebsiteDataStoreConfiguration::WebsiteDataStoreConfiguration(const WTF::UUID& id
+     , m_identifier(identifier)
+     , m_baseCacheDirectory(WebsiteDataStore::defaultWebsiteDataStoreDirectory(identifier))
+     , m_baseDataDirectory(WebsiteDataStore::defaultWebsiteDataStoreDirectory(identifier))
+-    , m_perOriginStorageQuota(WebsiteDataStore::defaultPerOriginQuota())
++    , m_perOriginStorageQuota(wispPerOriginStorageQuota())
+     , m_originQuotaRatio(WebsiteDataStore::defaultOriginQuotaRatio())
+     , m_totalQuotaRatio(WebsiteDataStore::defaultTotalQuotaRatio())
+     , m_standardVolumeCapacity(WebsiteDataStore::defaultStandardVolumeCapacity())
+@@ -94,7 +106,7 @@ WebsiteDataStoreConfiguration::WebsiteDataStoreConfiguration(const String& baseC
+     , m_unifiedOriginStorageLevel(WebsiteDataStore::defaultUnifiedOriginStorageLevel())
+     , m_baseCacheDirectory(baseCacheDirectory)
+     , m_baseDataDirectory(baseDataDirectory)
+-    , m_perOriginStorageQuota(WebsiteDataStore::defaultPerOriginQuota())
++    , m_perOriginStorageQuota(wispPerOriginStorageQuota())
+     , m_originQuotaRatio(WebsiteDataStore::defaultOriginQuotaRatio())
+     , m_totalQuotaRatio(WebsiteDataStore::defaultTotalQuotaRatio())
+     , m_standardVolumeCapacity(WebsiteDataStore::defaultStandardVolumeCapacity())
+-- 
+2.53.0
+

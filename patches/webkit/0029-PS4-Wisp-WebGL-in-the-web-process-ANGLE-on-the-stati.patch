@@ -1,0 +1,146 @@
+From b3ec4709ca55a4df151f98befc285a4f2cac3430 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Tue, 24 Nov 2026 19:53:34 +0300
+Subject: [PATCH] PS4 (Wisp): WebGL in the web process: ANGLE on the static
+ Mesa, and the same IPC with or without WebGL
+
+The web process's build has WebGL (ENABLE_WEBGL), the UI and network processes' build does not (no
+ANGLE in their program images).
+
+- ANGLE dlopen()ed libEGL.so.1; the PS4 has no shared libraries. FunctionsEGLDL asks
+  wisp_angle_egl_lookup() instead: the GPU web process defines it as Mesa's eglGetProcAddress (EGL and
+  GLES on Zink, linked statically); ANGLE's weak default finds nothing, so a process without Mesa has
+  no WebGL.
+- ANGLE's SimpleMutex used Linux futexes (<linux/futex.h>): the PS4's kernel is FreeBSD's, so
+  std::mutex there.
+- WebPageCreationParameters::shouldRenderWebGLInGPUProcess is sent with or without WebGL: a web
+  process with it read one more field than a UI without it wrote.
+- GPUConnectionToWebProcess's two WebGL messages (a GPU process's only) are under ENABLE(GPU_PROCESS)
+  too: MessageName numbered them only with WebGL, and every later message's number moved by two
+  between the two builds.
+---
+ .../ThirdParty/ANGLE/src/common/SimpleMutex.h |  3 ++-
+ .../renderer/gl/egl/FunctionsEGLDL.cpp        | 26 +++++++++++++++++++
+ .../GPUConnectionToWebProcess.messages.in     |  2 +-
+ .../WebKit/Shared/WebPageCreationParameters.h |  3 +--
+ ...WebPageCreationParameters.serialization.in |  2 --
+ 5 files changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/Source/ThirdParty/ANGLE/src/common/SimpleMutex.h b/Source/ThirdParty/ANGLE/src/common/SimpleMutex.h
+index 7d08e8aa..e2c405a2 100644
+--- a/Source/ThirdParty/ANGLE/src/common/SimpleMutex.h
++++ b/Source/ThirdParty/ANGLE/src/common/SimpleMutex.h
+@@ -33,7 +33,8 @@
+ //
+ // There is no TSAN support for futex currently, so it is disabled in that case
+ #if !defined(ANGLE_WITH_TSAN)
+-#    if defined(ANGLE_PLATFORM_LINUX) || defined(ANGLE_PLATFORM_ANDROID)
++// (PS4, Wisp: a FreeBSD kernel, no Linux futexes: std::mutex)
++#    if (defined(ANGLE_PLATFORM_LINUX) || defined(ANGLE_PLATFORM_ANDROID)) && !defined(__ORBIS__)
+ // Linux has had futexes for a very long time.  Assume support.
+ #        define ANGLE_USE_FUTEX 1
+ #    elif defined(ANGLE_PLATFORM_WINDOWS) && !defined(ANGLE_ENABLE_WINDOWS_UWP) && \
+diff --git a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/egl/FunctionsEGLDL.cpp b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/egl/FunctionsEGLDL.cpp
+index ddf84552..dd6c80a1 100644
+--- a/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/egl/FunctionsEGLDL.cpp
++++ b/Source/ThirdParty/ANGLE/src/libANGLE/renderer/gl/egl/FunctionsEGLDL.cpp
+@@ -24,6 +24,15 @@ namespace
+ void *nativeEGLHandle;
+ }  // anonymous namespace
+ 
++#if defined(__ORBIS__)
++// PS4 (Wisp): nothing to dlopen. The GPU web process links Mesa (EGL + GLES on Zink) statically and
++// defines this as its eglGetProcAddress; a process without Mesa has this default, and no WebGL.
++extern "C" __attribute__((weak)) void *wisp_angle_egl_lookup(const char *)
++{
++    return nullptr;
++}
++#endif
++
+ FunctionsEGLDL::FunctionsEGLDL() : mGetProcAddressPtr(nullptr) {}
+ 
+ FunctionsEGLDL::~FunctionsEGLDL() {}
+@@ -33,6 +42,18 @@ egl::Error FunctionsEGLDL::initialize(EGLAttrib platformType,
+                                       const char *libName,
+                                       void *eglHandle)
+ {
++#if defined(__ORBIS__)
++    (void)libName;
++    (void)eglHandle;
++    (void)nativeEGLHandle;
++    mGetProcAddressPtr =
++        reinterpret_cast<PFNEGLGETPROCADDRESSPROC>(wisp_angle_egl_lookup("eglGetProcAddress"));
++    if (!mGetProcAddressPtr)
++    {
++        return egl::Error(EGL_NOT_INITIALIZED, "No native EGL in this process (PS4)");
++    }
++    return FunctionsEGL::initialize(platformType, nativeDisplay);
++#else
+ 
+     if (eglHandle)
+     {
+@@ -60,6 +81,7 @@ egl::Error FunctionsEGLDL::initialize(EGLAttrib platformType,
+     }
+ 
+     return FunctionsEGL::initialize(platformType, nativeDisplay);
++#endif
+ }
+ 
+ void *FunctionsEGLDL::getProcAddress(const char *name) const
+@@ -69,7 +91,11 @@ void *FunctionsEGLDL::getProcAddress(const char *name) const
+     {
+         return f;
+     }
++#if defined(__ORBIS__)
++    return wisp_angle_egl_lookup(name);
++#else
+     return dlsym(nativeEGLHandle, name);
++#endif
+ }
+ 
+ }  // namespace rx
+diff --git a/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.messages.in b/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.messages.in
+index 83f1b0a1..c6993d9a 100644
+--- a/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.messages.in
++++ b/Source/WebKit/GPUProcess/GPUConnectionToWebProcess.messages.in
+@@ -30,7 +30,7 @@
+ messages -> GPUConnectionToWebProcess WantsDispatchMessage {
+     void CreateRenderingBackend(WebKit::RemoteRenderingBackendIdentifier renderingBackendIdentifier, IPC::StreamServerConnectionHandle connectionHandle) AllowedWhenWaitingForSyncReply
+     void ReleaseRenderingBackend(WebKit::RemoteRenderingBackendIdentifier renderingBackendIdentifier) AllowedWhenWaitingForSyncReply
+-#if ENABLE(WEBGL)
++#if ENABLE(WEBGL) && ENABLE(GPU_PROCESS)
+     [EnabledBy=WebGLEnabled && UseGPUProcessForWebGLEnabled] void CreateGraphicsContextGL(WebKit::RemoteGraphicsContextGLIdentifier identifier, struct WebCore::GraphicsContextGLAttributes attributes, WebKit::RemoteRenderingBackendIdentifier renderingBackendIdentifier, IPC::StreamServerConnectionHandle serverConnection) AllowedWhenWaitingForSyncReply
+     [EnabledBy=WebGLEnabled && UseGPUProcessForWebGLEnabled] void ReleaseGraphicsContextGL(WebKit::RemoteGraphicsContextGLIdentifier identifier) AllowedWhenWaitingForSyncReply
+ #endif
+diff --git a/Source/WebKit/Shared/WebPageCreationParameters.h b/Source/WebKit/Shared/WebPageCreationParameters.h
+index f912f920..d663df97 100644
+--- a/Source/WebKit/Shared/WebPageCreationParameters.h
++++ b/Source/WebKit/Shared/WebPageCreationParameters.h
+@@ -305,9 +305,8 @@ struct WebPageCreationParameters {
+     bool shouldRenderCanvasInGPUProcess { false };
+     bool shouldRenderDOMInGPUProcess { false };
+     bool shouldPlayMediaInGPUProcess { false };
+-#if ENABLE(WEBGL)
++    // (PS4, Wisp: sent with or without WebGL: the web process is built with it, the UI without)
+     bool shouldRenderWebGLInGPUProcess { false };
+-#endif
+     bool shouldEnableVP8Decoder { false };
+     bool shouldEnableVP9Decoder { false };
+ #if ENABLE(APP_BOUND_DOMAINS)
+diff --git a/Source/WebKit/Shared/WebPageCreationParameters.serialization.in b/Source/WebKit/Shared/WebPageCreationParameters.serialization.in
+index 8db54734..14faa506 100644
+--- a/Source/WebKit/Shared/WebPageCreationParameters.serialization.in
++++ b/Source/WebKit/Shared/WebPageCreationParameters.serialization.in
+@@ -219,9 +219,7 @@ enum class WebCore::UserInterfaceLayoutDirection : bool;
+     bool shouldRenderCanvasInGPUProcess;
+     bool shouldRenderDOMInGPUProcess;
+     bool shouldPlayMediaInGPUProcess;
+-#if ENABLE(WEBGL)
+     bool shouldRenderWebGLInGPUProcess;
+-#endif
+     bool shouldEnableVP8Decoder;
+     bool shouldEnableVP9Decoder;
+ #if ENABLE(APP_BOUND_DOMAINS)
+-- 
+2.53.0
+

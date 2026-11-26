@@ -1,0 +1,186 @@
+diff --git a/runtime/ps4_kit.h b/runtime/ps4_kit.h
+index 3462014..ebc0674 100644
+--- a/runtime/ps4_kit.h
++++ b/runtime/ps4_kit.h
+@@ -109,8 +109,11 @@ void ps4_kit_configure_heap(ps4_kit_heap_options* options);
+ void ps4_kit_set_arena_threads(const char* const* names, int count);
+ // The same for allocation-heavy compiler threads (LLVM, shader compilers): big arenas.
+ void ps4_kit_set_big_arena_threads(const char* const* names, int count);
+-// Called when a thread names itself; gives it an arena if the name is listed.
++// Called when a thread names itself; gives it an arena if the name is listed, and its listed priority.
+ void ps4_heap_private_arena(const char* name);
++// A priority (256 highest .. 767 lowest, 700 the default) for threads of this name (a pattern ending in '*'
++// matches by prefix), applied when a thread names itself (ps4_watch_thread). The string is kept, not copied.
++void ps4_kit_set_thread_priority_by_name(const char* name, int priority);
+ // Gives the calling thread an arena now, whatever its name (big: 1 for a big arena). 1 if it has one.
+ int ps4_kit_private_arena(int big);
+ // Automatic arenas at run time: the lock waits after which a thread gets one (0: none from now on;
+diff --git a/runtime/ps4_runtime.cpp b/runtime/ps4_runtime.cpp
+index cd848a2..f86a36d 100644
+--- a/runtime/ps4_runtime.cpp
++++ b/runtime/ps4_runtime.cpp
+@@ -1025,6 +1025,10 @@ void trimOverflowHeaps() {
+ // ~40 min to compile).
+ constexpr int MAX_PATTERNS = 64;
+ const char* g_arenaNames[MAX_PATTERNS];
++// Priorities by thread name (ps4_kit_set_thread_priority_by_name): patterns as for arenas
++const char* g_priorityNames[MAX_PATTERNS];
++int g_priorityValues[MAX_PATTERNS];
++int g_priorityNameCount = 0;
+ int g_arenaNameCount = 0;
+ const char* g_bigArenaNames[MAX_PATTERNS];
+ int g_bigArenaNameCount = 0;
+@@ -1436,9 +1440,32 @@ void ps4_kit_set_big_arena_threads(const char* const* names, int count) {
+     __atomic_store_n(&g_bigArenaNameCount, count, __ATOMIC_RELEASE);
+ }
+ 
++// A priority for threads by their name (OrbisWeb: WebKit's compiler threads). The PS4 runs an app's threads
++// by priority alone, with no turns among threads of one priority: six compiler threads at the default held
++// every core while a game compiled, and its own thread waited behind them; a step below the default they take
++// only the cores nothing else wants. Applied when a thread names itself (below). At most 64 patterns, kept
++// (string literals); one ending in '*' matches by prefix.
++void ps4_kit_set_thread_priority_by_name(const char* name, int priority) {
++    const int n = __atomic_load_n(&g_priorityNameCount, __ATOMIC_ACQUIRE);
++    if (!name || n >= MAX_PATTERNS)
++        return;
++    g_priorityNames[n] = name;
++    g_priorityValues[n] = clampInt(priority, 256, 767);
++    __atomic_store_n(&g_priorityNameCount, n + 1, __ATOMIC_RELEASE);
++}
++
+ // Gives the calling thread a private arena if the app listed its name (called when a thread names
+-// itself: SetThreadName -> ps4_watch_thread -> here).
++// itself: SetThreadName -> ps4_watch_thread -> here), and the priority listed for its name.
+ void ps4_heap_private_arena(const char* name) {
++    if (name) {
++        const int n = __atomic_load_n(&g_priorityNameCount, __ATOMIC_ACQUIRE);
++        for (int i = 0; i < n; i++) {
++            if (nameListed(name, &g_priorityNames[i], 1)) {
++                ps4k_scePthreadSetprio(ps4k_scePthreadSelf(), g_priorityValues[i]);
++                break;
++            }
++        }
++    }
+     if (t_arena || !name)
+         return;
+     const bool big = nameListed(name, g_bigArenaNames, __atomic_load_n(&g_bigArenaNameCount, __ATOMIC_ACQUIRE));
+diff --git a/runtime/ps4_sampler.cpp b/runtime/ps4_sampler.cpp
+index 2b707db..9aa4dd9 100644
+--- a/runtime/ps4_sampler.cpp
++++ b/runtime/ps4_sampler.cpp
+@@ -1154,6 +1154,9 @@ constexpr int kHotMax = 1024;  // samples per thread and window (50 a second at
+ struct HotThread {
+     bool running = true;  // at the last look
+     int looks = 0, busy = 0;
++    int missed = 0;  // looks in a row it did not answer (signals blocked: Mesa's threads)
++    uint64_t waits[kHotMax];  // where it waited: the first program frame of each waiting look
++    int waitCount = 0;
+     uint32_t gen = 0;  // the slot's generation these counts belong to
+     uint64_t samples[kHotMax];  // bucket (bit 63: system library), and for those the caller
+     uint64_t callers[kHotMax];
+@@ -1206,18 +1209,52 @@ void hotReport(int fd, double at) {
+                 if (pass == 0 && (key >> 63))
+                     snprintf(line, sizeof(line), "   %5.1f%% sys 0x%llx\n", 100.0 * entries[e].n / h.count,
+                              static_cast<unsigned long long>(key & ~(1ULL << 63)));
++                else if (pass == 0 && ((key >> 62) & 1))
++                    snprintf(line, sizeof(line), "   %5.1f%% jit 0x%08llx\n", 100.0 * entries[e].n / h.count,
++                             static_cast<unsigned long long>(key & 0xffffffffULL));
+                 else
+                     snprintf(line, sizeof(line), "   %5.1f%% elf 0x%llx\n", 100.0 * entries[e].n / (pass == 0 ? h.count : n),
+                              static_cast<unsigned long long>(key));
+                 writeLine(fd, line);
+             }
+         }
+-        h.looks = h.busy = h.count = 0;
++        // where it waited (the first program frame of each waiting look)
++        if (h.waitCount > 0) {
++            int n = 0;
++            for (int w = 0; w < h.waitCount; w++)
++                keys[n++] = h.waits[w];
++            std::sort(keys, keys + n);
++            int unique = 0;
++            for (int w = 0; w < n;) {
++                int e = w;
++                while (e < n && keys[e] == keys[w])
++                    e++;
++                entries[unique++] = {keys[w], e - w};
++                w = e;
++            }
++            std::sort(entries, entries + unique, [](const Entry& a, const Entry& b) { return a.n > b.n; });
++            snprintf(line, sizeof(line), "   waiting in (%d looks), from:\n", h.waitCount);
++            writeLine(fd, line);
++            for (int e = 0; e < unique && e < 12; e++) {
++                snprintf(line, sizeof(line), "   %5.1f%% elf 0x%llx\n", 100.0 * entries[e].n / n,
++                         static_cast<unsigned long long>(entries[e].key));
++                writeLine(fd, line);
++            }
++        }
++        h.looks = h.busy = h.count = h.waitCount = 0;
+     }
+ }
+ 
+ void* hotThread(void*) {
+     ps4_watch_thread("hot profiler");
++    // the last run's profile stays as profile.prev.log (a process started again, as a browser's page process
++    // is after a hang, kept nothing of the run that made it restart)
++    {
++        char from[160], to[160];
++        snprintf(from, sizeof(from), "%s/profile.log", ps4_diag_data_dir());
++        snprintf(to, sizeof(to), "%s/profile.prev.log", ps4_diag_data_dir());
++        rename(from, to);
++    }
+     const int fd = createDataFile("profile.log");
+     if (fd < 0)
+         return nullptr;
+@@ -1243,10 +1280,12 @@ void* hotThread(void*) {
+             if (const uint32_t gen = g_watched_gen[i].load(std::memory_order_acquire); gen != h.gen) {
+                 h.gen = gen;
+                 h.running = true;
+-                h.looks = h.busy = h.count = 0;
++                h.missed = 0;
++                h.looks = h.busy = h.count = h.waitCount = 0;
+             }
+             const pthread_t thread = t.thread.load();
+-            if (thread == pthread_t{} || thread == self || (!h.running && round % 50 != static_cast<unsigned>(i) % 50))
++            const unsigned every = h.busy > 0 ? 2 : 50;
++            if (thread == pthread_t{} || thread == self || (!h.running && round % every != static_cast<unsigned>(i) % every))
+                 continue;
+             if (!lockDumps(0))
+                 break;  // a thread dump is running: this round is skipped
+@@ -1255,16 +1294,34 @@ void* hotThread(void*) {
+             const bool in_umtx = t.in_umtx;
+             const uint64_t caller = t.frame_count > 0 ? t.frames[0] : 0;
+             unlockDumps();
+-            if (!answered)
++            // A thread that does not answer twice in a row is looked at as a waiting one (once in 50 rounds):
++            // each look waits 5 ms for it, and a dozen such threads (Mesa's, which block signals) made a
++            // round take ~0.3 s instead of 20 ms (OrbisWeb v00.44: 3 samples a second of a busy thread)
++            if (!answered) {
++                if (++h.missed >= 2)
++                    h.running = false;
+                 continue;
++            }
++            h.missed = 0;
+             h.looks++;
+             h.running = !in_umtx && !inSyscall(rip);
+-            if (!h.running || h.count >= kHotMax)
++            if (!h.running) {
++                if (h.waitCount < kHotMax)
++                    h.waits[h.waitCount++] = caller & ~0xFULL;
++                continue;
++            }
++            if (h.count >= kHotMax)
+                 continue;
+             h.busy++;
++            uint32_t guest = 0;
++            uint64_t host = 0;
+             if (isCode(rip)) {
+                 h.samples[h.count] = toElf(rip) & ~0xFULL;
+                 h.callers[h.count] = 0;
++            } else if (ps4_jit_owner && ps4_jit_owner(rip, &guest, &host)) {
++                // JIT code the port can name (OrbisWeb: a WebAssembly function, its tier in the top byte)
++                h.samples[h.count] = (1ULL << 62) | guest;
++                h.callers[h.count] = 0;
+             } else {
+                 h.samples[h.count] = (rip & ~0xFULL) | (1ULL << 63);
+                 h.callers[h.count] = caller & ~0xFULL;

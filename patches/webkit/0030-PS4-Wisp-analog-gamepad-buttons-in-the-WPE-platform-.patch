@@ -1,0 +1,138 @@
+From ea01e675d1f1debd1eb135000ce98004c40978ca Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Tue, 24 Nov 2026 19:53:34 +0300
+Subject: [PATCH] PS4 (Wisp): analog gamepad buttons in the WPE platform API
+
+WPEGamepad's button-event says pressed or released only, and a page's Gamepad API gives the triggers
+(the standard mapping's buttons 6 and 7) as values from 0 to 1. wpe_gamepad_button_value_event() and
+its button-value-event signal carry such a value; PlatformGamepadWPE takes it as the button's value
+(WebCore counts a button pressed above 0.1) and a press over 0.1 makes gamepads visible to pages, as a
+button-event press does. The PS4 port (ui/platform.cpp) sends L2 and R2 this way.
+---
+ .../Gamepad/wpe/PlatformGamepadWPE.cpp        | 15 ++++++++
+ .../Gamepad/wpe/PlatformGamepadWPE.h          |  1 +
+ Source/WebKit/WPEPlatform/wpe/WPEGamepad.cpp  | 34 +++++++++++++++++++
+ Source/WebKit/WPEPlatform/wpe/WPEGamepad.h    |  3 ++
+ 4 files changed, 53 insertions(+)
+
+diff --git a/Source/WebKit/UIProcess/Gamepad/wpe/PlatformGamepadWPE.cpp b/Source/WebKit/UIProcess/Gamepad/wpe/PlatformGamepadWPE.cpp
+index 726b4a19..7a8eeb09 100644
+--- a/Source/WebKit/UIProcess/Gamepad/wpe/PlatformGamepadWPE.cpp
++++ b/Source/WebKit/UIProcess/Gamepad/wpe/PlatformGamepadWPE.cpp
+@@ -66,6 +66,11 @@ PlatformGamepadWPE::PlatformGamepadWPE(WPEGamepad* gamepad, unsigned index)
+     g_signal_connect_swapped(m_gamepad.get(), "axis-event", G_CALLBACK(+[](PlatformGamepadWPE* gamepad, WPEGamepadAxis axis, gdouble value) {
+         gamepad->axisEvent(static_cast<size_t>(axis), value);
+     }), this);
++
++    // (PS4, Wisp: analog buttons, the triggers)
++    g_signal_connect_swapped(m_gamepad.get(), "button-value-event", G_CALLBACK(+[](PlatformGamepadWPE* gamepad, WPEGamepadButton button, gdouble value) {
++        gamepad->buttonValueEvent(static_cast<size_t>(button), value);
++    }), this);
+ }
+ 
+ PlatformGamepadWPE::~PlatformGamepadWPE()
+@@ -80,6 +85,16 @@ void PlatformGamepadWPE::buttonEvent(size_t button, bool isPressed)
+     GamepadProviderWPE::singleton().notifyInput(*this, isPressed ? GamepadProviderWPE::ShouldMakeGamepadsVisible::Yes : GamepadProviderWPE::ShouldMakeGamepadsVisible::No);
+ }
+ 
++void PlatformGamepadWPE::buttonValueEvent(size_t button, double value)
++{
++    if (button >= m_buttonValues.size())
++        return;
++    m_lastUpdateTime = MonotonicTime::now();
++    m_buttonValues[button].setValue(value);
++    // (as WebCore's GamepadButton: pressed above 0.1, and a press makes gamepads visible to pages)
++    GamepadProviderWPE::singleton().notifyInput(*this, value > 0.1 ? GamepadProviderWPE::ShouldMakeGamepadsVisible::Yes : GamepadProviderWPE::ShouldMakeGamepadsVisible::No);
++}
++
+ void PlatformGamepadWPE::axisEvent(size_t axis, double value)
+ {
+     m_lastUpdateTime = MonotonicTime::now();
+diff --git a/Source/WebKit/UIProcess/Gamepad/wpe/PlatformGamepadWPE.h b/Source/WebKit/UIProcess/Gamepad/wpe/PlatformGamepadWPE.h
+index a2611486..db891631 100644
+--- a/Source/WebKit/UIProcess/Gamepad/wpe/PlatformGamepadWPE.h
++++ b/Source/WebKit/UIProcess/Gamepad/wpe/PlatformGamepadWPE.h
+@@ -50,6 +50,7 @@ private:
+     void stopEffects(CompletionHandler<void()>&&) final;
+ 
+     void buttonEvent(size_t button, bool isPressed);
++    void buttonValueEvent(size_t button, double value);
+     void axisEvent(size_t axis, double value);
+ 
+     void effectDelayTimerFired();
+diff --git a/Source/WebKit/WPEPlatform/wpe/WPEGamepad.cpp b/Source/WebKit/WPEPlatform/wpe/WPEGamepad.cpp
+index 4c148271..645e6016 100644
+--- a/Source/WebKit/WPEPlatform/wpe/WPEGamepad.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/WPEGamepad.cpp
+@@ -62,6 +62,7 @@ static std::array<GParamSpec*, N_PROPERTIES> sObjProperties;
+ enum {
+     BUTTON_EVENT,
+     AXIS_EVENT,
++    BUTTON_VALUE_EVENT,
+ 
+     LAST_SIGNAL
+ };
+@@ -149,6 +150,24 @@ static void wpe_gamepad_class_init(WPEGamepadClass* gamepadClass)
+         G_TYPE_NONE, 2,
+         WPE_TYPE_GAMEPAD_AXIS,
+         G_TYPE_DOUBLE);
++
++    /**
++     * WPEGamepad::button-value-event:
++     * @gamepad: a #WPEGamepad
++     * @button: a #WPEGamepadButton
++     * @value: how far @button is pressed, from 0 to 1
++     *
++     * Emitted when the value of an analog button (a trigger) changes. (PS4, Wisp)
++     */
++    signals[BUTTON_VALUE_EVENT] = g_signal_new(
++        "button-value-event",
++        G_TYPE_FROM_CLASS(gamepadClass),
++        G_SIGNAL_RUN_LAST,
++        0, nullptr, nullptr,
++        g_cclosure_marshal_generic,
++        G_TYPE_NONE, 2,
++        WPE_TYPE_GAMEPAD_BUTTON,
++        G_TYPE_DOUBLE);
+ }
+ 
+ /**
+@@ -239,6 +258,21 @@ void wpe_gamepad_axis_event(WPEGamepad* gamepad, WPEGamepadAxis axis, gdouble va
+     g_signal_emit(gamepad, signals[AXIS_EVENT], 0, axis, value);
+ }
+ 
++/**
++ * wpe_gamepad_button_value_event:
++ * @gamepad: a #WPEGamepad
++ * @button: a #WPEGamepadButton
++ * @value: how far @button is pressed, from 0 to 1
++ *
++ * Emit #WPEGamepad::button-value-event: an analog button's value (a trigger). (PS4, Wisp)
++ */
++void wpe_gamepad_button_value_event(WPEGamepad* gamepad, WPEGamepadButton button, gdouble value)
++{
++    g_return_if_fail(WPE_IS_GAMEPAD(gamepad));
++    g_return_if_fail(value >= 0. && value <= 1.);
++    g_signal_emit(gamepad, signals[BUTTON_VALUE_EVENT], 0, button, value);
++}
++
+ /**
+  * wpe_gamepad_has_rumble:
+  * @gamepad: a #WPEGamepad
+diff --git a/Source/WebKit/WPEPlatform/wpe/WPEGamepad.h b/Source/WebKit/WPEPlatform/wpe/WPEGamepad.h
+index 74784334..dee8730e 100644
+--- a/Source/WebKit/WPEPlatform/wpe/WPEGamepad.h
++++ b/Source/WebKit/WPEPlatform/wpe/WPEGamepad.h
+@@ -122,6 +122,9 @@ WPE_API void        wpe_gamepad_button_event        (WPEGamepad      *gamepad,
+ WPE_API void        wpe_gamepad_axis_event          (WPEGamepad      *gamepad,
+                                                      WPEGamepadAxis   axis,
+                                                      gdouble          value);
++WPE_API void        wpe_gamepad_button_value_event  (WPEGamepad      *gamepad,
++                                                     WPEGamepadButton button,
++                                                     gdouble          value);
+ WPE_API gboolean    wpe_gamepad_has_rumble          (WPEGamepad      *gamepad);
+ WPE_API gboolean    wpe_gamepad_rumble              (WPEGamepad      *gamepad,
+                                                      gdouble          strong_magnitude,
+-- 
+2.53.0
+

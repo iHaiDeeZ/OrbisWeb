@@ -1,0 +1,186 @@
+From 48681155ce6458c3c7122c1be0806305c2cbf2d2 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Thu, 26 Nov 2026 16:43:10 +0300
+Subject: [PATCH] PS4 (Wisp): what still holds memory after a page leaves
+
+v00.43 had Midnight Club 3's 2 GiB WebAssembly memory stay in direct memory
+after its tab closed, with no worker or worklet thread left alive, and nothing
+in the log said what held it: the next game (Bomberman 64, 512 MiB) got none.
+
+5 s and 30 s after a page leaves the web process (after the collection that
+asks for), web.log says: WebKit's pages in direct memory; the main thread's
+script heap, its global objects (and those kept from C++), and every buffer of
+64 MiB or more it still reaches (ArrayBuffer, SharedArrayBuffer, WebAssembly
+memory), each with the page it belongs to and whether that page is on show or
+gone; documents (and those without a frame), worker and worklet threads, audio
+contexts. Big memory held while the script heap reaches none of it is held
+from C++. WISP_HELD_REPORT=0 turns it off.
+---
+ Source/WebCore/page/MemoryRelease.cpp   | 106 ++++++++++++++++++++++++
+ Source/WebCore/page/MemoryRelease.h     |   4 +
+ Source/WebKit/WebProcess/WebProcess.cpp |  13 +++
+ 3 files changed, 123 insertions(+)
+
+diff --git a/Source/WebCore/page/MemoryRelease.cpp b/Source/WebCore/page/MemoryRelease.cpp
+index 3def8012..3631ad19 100644
+--- a/Source/WebCore/page/MemoryRelease.cpp
++++ b/Source/WebCore/page/MemoryRelease.cpp
+@@ -67,6 +67,18 @@
+ #include "WorkerGlobalScope.h"
+ #include "WorkerThread.h"
+ #include <JavaScriptCore/VM.h>
++#if defined(__ORBIS__)
++#include "Document.h"
++#include "JSDOMGlobalObject.h"
++#include "WorkerOrWorkletThread.h"
++#include <JavaScriptCore/HeapIterationScope.h>
++#include <JavaScriptCore/JSArrayBuffer.h>
++#include <JavaScriptCore/JSCInlines.h>
++#include <JavaScriptCore/MarkedSpaceInlines.h>
++#if ENABLE(WEBASSEMBLY)
++#include <JavaScriptCore/JSWebAssemblyMemory.h>
++#endif
++#endif
+ #include <wtf/ResourceUsage.h>
+ #include <wtf/SystemTracing.h>
+ #include <wtf/text/MakeString.h>
+@@ -292,4 +304,98 @@ void jettisonExpensiveObjectsOnTopLevelNavigation() { }
+ void registerMemoryReleaseNotifyCallbacks() { }
+ #endif
+ 
++#if defined(__ORBIS__)
++} // namespace WebCore
++
++extern "C" size_t wtf_ps4_page_memory(size_t* held); // WTF/wtf/ps4/OSAllocatorPS4.cpp
++
++namespace WebCore {
++
++size_t wispLiveAudioContextCount(); // Modules/webaudio/BaseAudioContext.cpp
++
++// PS4 (Wisp): what still holds memory after a page left the process (WebKit's WebProcess::removeWebPage calls this
++// after its collection): WebKit's pages in direct memory (where a game's WebAssembly memory is); the main thread's
++// script heap, its global objects and the big buffers it still reaches, each with the page it belongs to; documents,
++// worker and worklet threads, audio contexts. A closed game's memory that stays shows its holder here: v00.43 had
++// Midnight Club 3's 2 GiB stay with no worker or worklet thread left, and nothing said what held it.
++void wispReportHeldMemory(const char* when)
++{
++    size_t heldBytes = 0;
++    const size_t pageBytes = wtf_ps4_page_memory(&heldBytes);
++
++    auto& vm = commonVM();
++    JSC::JSLockHolder lock(vm);
++    const size_t globals = vm.heap.globalObjectCount();
++    const size_t keptGlobals = vm.heap.protectedGlobalObjectCount();
++
++    struct Held {
++        size_t bytes;
++        String what;
++    };
++    HashMap<const void*, Held> big;
++    {
++        JSC::HeapIterationScope iterationScope(vm.heap);
++        vm.heap.objectSpace().forEachLiveCell(iterationScope, [&](JSC::HeapCell* heapCell, JSC::HeapCell::Kind kind) {
++            if (!JSC::isJSCellKind(kind))
++                return IterationStatus::Continue;
++            SUPPRESS_MEMORY_UNSAFE_CAST auto* cell = static_cast<JSC::JSCell*>(heapCell);
++            const void* data = nullptr;
++            size_t bytes = 0;
++            JSC::JSGlobalObject* realm = nullptr;
++            ASCIILiteral kindName = "ArrayBuffer"_s;
++            if (auto* buffer = dynamicDowncast<JSC::JSArrayBuffer>(cell)) {
++                if (auto* impl = buffer->impl()) {
++                    data = impl->data();
++                    bytes = impl->byteLength();
++                }
++                realm = buffer->realm();
++                if (buffer->isShared())
++                    kindName = "SharedArrayBuffer"_s;
++            }
++#if ENABLE(WEBASSEMBLY)
++            else if (auto* memory = dynamicDowncast<JSC::JSWebAssemblyMemory>(cell)) {
++                data = memory->memory().basePointer();
++                bytes = memory->memory().size();
++                realm = memory->realm();
++                kindName = "WebAssembly.Memory"_s;
++            }
++#endif
++            if (!data || bytes < (static_cast<size_t>(64) << 20) || big.contains(data))
++                return IterationStatus::Continue;
++            String where = "a script world without a document"_s;
++            if (auto* domGlobal = dynamicDowncast<JSDOMGlobalObject>(realm)) {
++                if (RefPtr context = domGlobal->scriptExecutionContext()) {
++                    if (RefPtr document = dynamicDowncast<Document>(*context))
++                        where = makeString(document->frame() ? "a page on show, "_s : "a page that is gone, "_s, document->url().string().left(90));
++                    else
++                        where = context->url().string().left(90);
++                } else
++                    where = "a page whose document is gone"_s;
++            }
++            big.add(data, Held { bytes, makeString(kindName, " of "_s, where) });
++            return IterationStatus::Continue;
++        });
++    }
++    size_t bigBytes = 0;
++    for (auto& entry : big.values())
++        bigBytes += entry.bytes;
++
++    size_t documents = 0;
++    size_t frameless = 0;
++    for (auto& document : Document::allDocuments()) {
++        documents++;
++        if (!document->frame())
++            frameless++;
++    }
++    size_t threads = 0;
++    WorkerOrWorkletThread::workerOrWorkletThreads().forEach([&](auto&) {
++        threads++;
++    });
++    WTFLogAlways("memory (%s): WebKit's pages hold %zu MiB of direct memory (%zu MiB taken); the main thread's script: %zu global objects (%zu kept from C++), %zu MiB in %u big buffers it reaches; %zu documents (%zu without a frame); %zu worker and worklet threads; %zu audio contexts",
++        when, pageBytes >> 20, heldBytes >> 20, globals, keptGlobals, bigBytes >> 20, big.size(), documents, frameless, threads, wispLiveAudioContextCount());
++    for (auto& entry : big.values())
++        WTFLogAlways("memory:   %zu MiB, %s", entry.bytes >> 20, entry.what.utf8().data());
++}
++#endif
++
+ } // namespace WebCore
+diff --git a/Source/WebCore/page/MemoryRelease.h b/Source/WebCore/page/MemoryRelease.h
+index 8c9d85fb..0b9b5a79 100644
+--- a/Source/WebCore/page/MemoryRelease.h
++++ b/Source/WebCore/page/MemoryRelease.h
+@@ -45,5 +45,9 @@ void platformReleaseGraphicsMemory(Critical);
+ void jettisonExpensiveObjectsOnTopLevelNavigation();
+ WEBCORE_EXPORT void registerMemoryReleaseNotifyCallbacks();
+ WEBCORE_EXPORT void logMemoryStatistics(LogMemoryStatisticsReason);
++#if defined(__ORBIS__)
++// PS4 (Wisp): what still holds memory, in the log (after a page left the web process)
++WEBCORE_EXPORT void wispReportHeldMemory(const char* when);
++#endif
+ 
+ } // namespace WebCore
+diff --git a/Source/WebKit/WebProcess/WebProcess.cpp b/Source/WebKit/WebProcess/WebProcess.cpp
+index f283716e..21184d6c 100644
+--- a/Source/WebKit/WebProcess/WebProcess.cpp
++++ b/Source/WebKit/WebProcess/WebProcess.cpp
+@@ -1123,6 +1123,19 @@ static void wispReleaseMemoryAfterPageRemoval()
+         WebCore::releaseMemory(Critical::No, Synchronous::No, WebCore::MaintainBackForwardCache::Yes, WebCore::MaintainMemoryCache::No);
+         WebCore::GarbageCollectionController::singleton().garbageCollectOnNextRunLoop();
+         WTFLogAlways("memory: a page left the process: caches released (%zu MiB in use before), a full garbage collection next", before >> 20);
++        // what still holds memory once that collection ran, and later again (WISP_HELD_REPORT=0: no report)
++        static const bool report = [] {
++            const char* value = getenv("WISP_HELD_REPORT");
++            return !value || value[0] != '0';
++        }();
++        if (!report)
++            return;
++        RunLoop::mainSingleton().dispatchAfter(3_s, [] {
++            WebCore::wispReportHeldMemory("5 s after a page left");
++        });
++        RunLoop::mainSingleton().dispatchAfter(28_s, [] {
++            WebCore::wispReportHeldMemory("30 s after a page left");
++        });
+     });
+ }
+ #endif
+-- 
+2.53.0
+

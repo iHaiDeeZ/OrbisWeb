@@ -1,0 +1,177 @@
+From 811171b1a607cfb118dcbbc384d97613d35ef403 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Fri, 20 Nov 2026 00:08:02 +0300
+Subject: [PATCH] PS4 (Wisp): IPC messages are never dropped on the PS4's unix
+ sockets: EMSGSIZE is back-pressure, socket pairs get 256 KiB
+
+The PS4's kernel (FreeBSD 9) shrinks a unix SOCK_SEQPACKET sender's room by what the receiver has not read yet, and a send larger than what is left fails with EMSGSIZE instead of EAGAIN. WebKit's GLib connection took that for an error and dropped the message: a lost mouse event left the page's mouse queue waiting for good, a lost key or reload did nothing. The message now waits 1 ms and goes again (the ones after it wait behind it), the socket pairs get 256 KiB of room, and lost messages and receive errors are logged (WISP_IPC_LOG=0: quiet).
+---
+ .../Platform/IPC/glib/ConnectionGLib.cpp      | 60 +++++++++++++++++++
+ .../Platform/IPC/unix/IPCUtilitiesUnix.cpp    | 42 +++++++++++++
+ 2 files changed, 102 insertions(+)
+
+diff --git a/Source/WebKit/Platform/IPC/glib/ConnectionGLib.cpp b/Source/WebKit/Platform/IPC/glib/ConnectionGLib.cpp
+index d5b3cce6..82da2715 100644
+--- a/Source/WebKit/Platform/IPC/glib/ConnectionGLib.cpp
++++ b/Source/WebKit/Platform/IPC/glib/ConnectionGLib.cpp
+@@ -46,8 +46,36 @@
+ #include <wtf/SafeStrerror.h>
+ #endif
+ 
++#if defined(__ORBIS__)
++#include <atomic>
++#include <cstdlib>
++#include <cstring>
++#endif
++
+ namespace IPC {
+ 
++#if defined(__ORBIS__)
++// PS4 (Wisp): IPC lines in the process's log (Wisp's settings.txt ipc_log=0 turns them off: WISP_IPC_LOG)
++static bool wispIPCLog()
++{
++    static const bool on = [] {
++        const char* value = getenv("WISP_IPC_LOG");
++        return !value || strcmp(value, "0");
++    }();
++    return on;
++}
++
++static void wispNoteSendWait(const GError* error, size_t bodySize, size_t attachmentCount)
++{
++    static std::atomic<unsigned> waits;
++    const unsigned count = ++waits;
++    if (wispIPCLog() && (count <= 5 || !(count % 1000))) {
++        WTFLogAlways("PS4 (Wisp) IPC: a %zu-byte message (%zu attachments) waits for room (%s: the kernel's back-pressure on a busy unix socket) and goes again in 1 ms; %u waits in this process so far",
++            bodySize, attachmentCount, error ? error->message : "?", count);
++    }
++}
++#endif
++
+ static constexpr size_t s_messageMaxSize = 4096;
+ static constexpr size_t s_attachmentMaxAmount = 254;
+ 
+@@ -314,6 +342,11 @@ void Connection::readyReadHandler()
+ 
+             if (m_isConnected) {
+                 RELEASE_LOG_ERROR(IPC, "Error receiving IPC message on socket %d in process %d: %s", g_socket_get_fd(m_socket.get()), getpid(), error->message);
++#if defined(__ORBIS__)
++                // PS4 (Wisp): said (release builds drop RELEASE_LOG_ERROR); the connection ends here
++                if (wispIPCLog())
++                    WTFLogAlways("PS4 (Wisp) IPC: receiving failed and the connection closes (socket %d, process %d): %s", g_socket_get_fd(m_socket.get()), getpid(), error ? error->message : "the control data was cut short (MSG_CTRUNC)");
++#endif
+                 connectionDidClose();
+             }
+             return;
+@@ -500,6 +533,28 @@ bool Connection::sendOutputMessage(UnixMessage&& outputMessage)
+         return false;
+     }
+ 
++#if defined(__ORBIS__)
++    // PS4 (Wisp): the PS4's kernel (FreeBSD 9) shrinks a unix SOCK_SEQPACKET sender's room by what the
++    // receiver has not read yet, and a send larger than what is left fails with EMSGSIZE, not EAGAIN
++    // (FreeBSD's own note in uipc_usrreq.c: it "can lead to undesired return of EMSGSIZE on send
++    // instead of more desirable blocking"). WebKit took that for an error and dropped the message: a lost
++    // mouse event left the page's mouse queue waiting for its answer for good (no click reached the page
++    // again), a lost reload or key did nothing (Wisp v00.12, v00.14). It is back-pressure: the message
++    // waits and goes again, and the messages after it wait behind it, in order.
++    if (g_error_matches(error.get(), G_IO_ERROR, G_IO_ERROR_MESSAGE_TOO_LARGE) || g_error_matches(error.get(), G_IO_ERROR, G_IO_ERROR_NO_SPACE)) {
++        wispNoteSendWait(error.get(), outputMessage.bodySize(), outputMessage.attachments().size());
++        m_hasPendingOutputMessage = true;
++        m_connectionQueue->dispatchAfter(Seconds::fromMilliseconds(1), [this, protectedThis = protect(*this), message = WTF::move(outputMessage)]() mutable {
++            m_hasPendingOutputMessage = false;
++            if (m_isConnected) {
++                sendOutputMessage(WTF::move(message));
++                sendOutgoingMessages();
++            }
++        });
++        return false;
++    }
++#endif
++
+     if (g_error_matches(error.get(), G_IO_ERROR, G_IO_ERROR_CONNECTION_CLOSED) || g_error_matches(error.get(), G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+         connectionDidClose();
+         return false;
+@@ -507,6 +562,11 @@ bool Connection::sendOutputMessage(UnixMessage&& outputMessage)
+ 
+     if (m_isConnected)
+         RELEASE_LOG_ERROR(IPC, "Error sending IPC message on socket %d in process %d: %s", g_socket_get_fd(m_socket.get()), getpid(), error->message);
++#if defined(__ORBIS__)
++    // PS4 (Wisp): said (release builds drop RELEASE_LOG_ERROR): this message is lost
++    if (m_isConnected && wispIPCLog())
++        WTFLogAlways("PS4 (Wisp) IPC: a message could not be sent and is lost (socket %d, process %d): %s", g_socket_get_fd(m_socket.get()), getpid(), error ? error->message : "?");
++#endif
+     return false;
+ }
+ IGNORE_CLANG_WARNINGS_END
+diff --git a/Source/WebKit/Platform/IPC/unix/IPCUtilitiesUnix.cpp b/Source/WebKit/Platform/IPC/unix/IPCUtilitiesUnix.cpp
+index 5ba3ea56..25a8d1b2 100644
+--- a/Source/WebKit/Platform/IPC/unix/IPCUtilitiesUnix.cpp
++++ b/Source/WebKit/Platform/IPC/unix/IPCUtilitiesUnix.cpp
+@@ -29,8 +29,42 @@
+ #include <sys/socket.h>
+ #include <wtf/UniStdExtras.h>
+ 
++#if defined(__ORBIS__)
++#include <atomic>
++#include <cstdlib>
++#include <cstring>
++#include <wtf/Assertions.h>
++#endif
++
+ namespace IPC {
+ 
++#if defined(__ORBIS__)
++// PS4 (Wisp): the PS4's kernel (FreeBSD 9) gives a unix SOCK_SEQPACKET socket 8 KiB, and counts what the
++// receiver has not read yet against the sender's room: a few KiB behind, the next send fails with
++// EMSGSIZE (ConnectionGLib.cpp then waits and sends it again). More room makes that rare. (Socket
++// buffers are the kernel's memory, used only while messages wait to be read.)
++static void widenSocketBuffers(int socket)
++{
++    int sendBefore = 0;
++    int receiveBefore = 0;
++    socklen_t length = sizeof(int);
++    getsockopt(socket, SOL_SOCKET, SO_SNDBUF, &sendBefore, &length);
++    length = sizeof(int);
++    getsockopt(socket, SOL_SOCKET, SO_RCVBUF, &receiveBefore, &length);
++    int widened = 0;
++    for (int bytes : { 256 * 1024, 128 * 1024, 64 * 1024, 32 * 1024 }) {
++        if (!setsockopt(socket, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes)) && !setsockopt(socket, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes))) {
++            widened = bytes;
++            break;
++        }
++    }
++    static std::atomic<bool> told;
++    const char* log = getenv("WISP_IPC_LOG");
++    if ((!log || strcmp(log, "0")) && !told.exchange(true))
++        WTFLogAlways("PS4 (Wisp) IPC: WebKit's sockets had %d (send) / %d (receive) bytes of room, now %d", sendBefore, receiveBefore, widened);
++}
++#endif
++
+ SocketPair createPlatformConnection(int socketType, unsigned options)
+ {
+     std::array<int, 2> sockets;
+@@ -43,12 +77,20 @@ SocketPair createPlatformConnection(int socketType, unsigned options)
+             RELEASE_ASSERT(unsetCloseOnExec(sockets[1]));
+         if (!(options & SetCloexecOnClient))
+             RELEASE_ASSERT(unsetCloseOnExec(sockets[0]));
++#if defined(__ORBIS__)
++        widenSocketBuffers(sockets[0]);
++        widenSocketBuffers(sockets[1]);
++#endif
+ 
+         return { { sockets[0], UnixFileDescriptor::Adopt }, { sockets[1], UnixFileDescriptor::Adopt } };
+     }
+ #endif
+ 
+     RELEASE_ASSERT(socketpair(AF_UNIX, socketType, 0, sockets.data()) != -1);
++#if defined(__ORBIS__)
++    widenSocketBuffers(sockets[0]);
++    widenSocketBuffers(sockets[1]);
++#endif
+ 
+     if (options & SetCloexecOnServer)
+         RELEASE_ASSERT(setCloseOnExec(sockets[1]));
+-- 
+2.53.0
+

@@ -1,0 +1,41 @@
+From 1608e2bef9bea887142054798e538816410fb1bc Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Fri, 20 Nov 2026 01:14:43 +0300
+Subject: [PATCH] PS4 (Wisp): navigator.platform says the platform the user
+ agent names (it was empty)
+
+A desktop browser user agent with an empty navigator.platform is a bot's mark to sites' human checks (Cloudflare's Turnstile). The PS4 build now answers as the browser its user agent names: MacIntel for the default Safari on macOS one.
+---
+ Source/WebCore/page/NavigatorBase.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/Source/WebCore/page/NavigatorBase.cpp b/Source/WebCore/page/NavigatorBase.cpp
+index 93a8e71c..77624b76 100644
+--- a/Source/WebCore/page/NavigatorBase.cpp
++++ b/Source/WebCore/page/NavigatorBase.cpp
+@@ -110,6 +110,22 @@ String NavigatorBase::platform() const
+     return "Win32"_s;
+ #elif OS(HAIKU)
+     return "Haiku"_s;
++#elif defined(__ORBIS__)
++    // PS4 (Wisp): the platform the user agent names, as that browser says it (Safari on macOS by default:
++    // "MacIntel"). It was "": a desktop browser's user agent with no platform is a bot's mark to sites'
++    // human checks (Cloudflare's Turnstile never let Wisp through).
++    const String& agent = userAgent();
++    if (agent.contains("iPhone"_s))
++        return "iPhone"_s;
++    if (agent.contains("iPad"_s))
++        return "iPad"_s;
++    if (agent.contains("Windows"_s))
++        return "Win32"_s;
++    if (agent.contains("Android"_s))
++        return "Linux armv8l"_s;
++    if (agent.contains("Linux"_s) || agent.contains("X11"_s))
++        return "Linux x86_64"_s;
++    return "MacIntel"_s;
+ #else
+     return ""_s;
+ #endif
+-- 
+2.53.0
+

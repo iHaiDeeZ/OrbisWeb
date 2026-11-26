@@ -1,0 +1,1151 @@
+diff --git a/src/amd/common/ac_ps4_drm.c b/src/amd/common/ac_ps4_drm.c
+index 18ce9a6..32fa7ef 100644
+--- a/src/amd/common/ac_ps4_drm.c
++++ b/src/amd/common/ac_ps4_drm.c
+@@ -147,6 +147,8 @@ struct ac_drm_device {
+ 
+    /* Statistics for the app's monitor (ac_ps4_get_stats). */
+    uint64_t bo_bytes, bo_count;
++   /* PS4 (Wisp): bytes of freed buffers waiting in the quarantine (ps4_run_deferred_ex) */
++   uint64_t deferred_bytes;
+ 
+    /* Handle table. ps4_bo() reads it without the lock (from any thread, e.g. Dolphin's shader
+     * compiler threads), so a full table is copied, never reallocated: old tables stay valid. */
+@@ -1099,9 +1101,9 @@ static ac_drm_device *ps4_last_device;
+ static unsigned ps4_verbose_left = 64;
+ #define PS4_VERBOSE(...) do { if (ps4_verbose_left) { ps4_verbose_left--; ps4_log(__VA_ARGS__); } } while (0)
+ 
+-int
+-ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, uint32_t *minor_version,
+-                         ac_drm_device **out)
++static int
++ps4_device_create(int fd, bool is_virtio, uint32_t *major_version, uint32_t *minor_version,
++                  ac_drm_device **out)
+ {
+    (void)fd;
+    (void)is_virtio;
+@@ -1186,6 +1188,33 @@ fail:
+    return -ENODEV;
+ }
+ 
++/* PS4 (Wisp): one device for the whole process, as one render node is on Linux: RADV finds its
++ * winsys again by the device's cookie and shares it among all Vulkan instances - WebKit's and
++ * ANGLE's zink screens, Dawn's WebGPU devices. A device per instance reserved new GPU address
++ * windows every time (24 GiB each below the GPU's 1 TiB limit: room for about 30) and kept its
++ * quarantine of freed memory (up to 96 MiB) after its instance was gone, as nothing tears a
++ * device down: v00.45 made nine in one session, one or two for every WebGL or WebGPU page. */
++int
++ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, uint32_t *minor_version,
++                         ac_drm_device **out)
++{
++   static simple_mtx_t create_lock = SIMPLE_MTX_INITIALIZER;
++   static unsigned shared;
++   simple_mtx_lock(&create_lock);
++   int r = 0;
++   if (ps4_last_device) {
++      *major_version = AC_PS4_DRM_MAJOR;
++      *minor_version = AC_PS4_DRM_MINOR;
++      *out = ps4_last_device;
++      if (++shared <= 8)
++         ps4_log("radv/ps4: another Vulkan instance shares the device (%u)\n", shared);
++   } else {
++      r = ps4_device_create(fd, is_virtio, major_version, minor_version, out);
++   }
++   simple_mtx_unlock(&create_lock);
++   return r;
++}
++
+ struct util_sync_provider *
+ ac_drm_device_get_sync_provider(ac_drm_device *dev)
+ {
+@@ -1224,9 +1253,15 @@ ps4_bo(ac_drm_device *dev, uint32_t handle)
+    return handle && handle < num ? __atomic_load_n(&bos[handle], __ATOMIC_ACQUIRE) : NULL;
+ }
+ 
++/* PS4 (Wisp): set while this thread's last ac_drm_bo_alloc has failed. RADV frees the address
++ * range it took for that buffer right after (radv_amdgpu_winsys_bo_create's error_bo_alloc): a
++ * range nothing was mapped into, which ac_drm_va_range_free then releases at once. */
++static __thread bool ps4_bo_alloc_failed;
++
+ int
+ ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_drm_bo *out)
+ {
++   ps4_bo_alloc_failed = true; /* until it succeeds */
+    struct amdgpu_bo *bo = calloc(1, sizeof(*bo));
+    if (!bo)
+       return -ENOMEM;
+@@ -1295,6 +1330,7 @@ ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_drm_
+    PS4_VERBOSE("radv/ps4: bo %u: %llu bytes, heap %#x, flags %#llx, align %#llx, phys %#llx\n",
+                bo->handle, (unsigned long long)bo->size, bo->heap, (unsigned long long)bo->flags,
+                (unsigned long long)align, (unsigned long long)bo->phys);
++   ps4_bo_alloc_failed = false;
+    return 0;
+ }
+ 
+@@ -1725,6 +1761,19 @@ ac_drm_va_range_free(amdgpu_va_handle va)
+ {
+    if (!va)
+       return 0;
++   if (ps4_bo_alloc_failed) {
++      /* PS4 (Wisp): the range of a buffer that could not be allocated: nothing was mapped into
++       * it, so it goes back now. Deferred like the others, such ranges waited for freed buffers'
++       * bytes to push them out of the quarantine (ps4_run_deferred_ex), bytes that never came
++       * while the memory was gone, and they filled the 16 GiB window: v00.44, Star Fox 64, 123,000
++       * failed va_range_allocs after the direct memory ran out. */
++      ps4_bo_alloc_failed = false;
++      simple_mtx_lock(&ps4_va_lock);
++      util_vma_heap_free(va->heap, va->addr, va->size);
++      simple_mtx_unlock(&ps4_va_lock);
++      free(va);
++      return 0;
++   }
+    ps4_defer(va->dev, (struct ps4_deferred){.op = 'V', .va = va});
+    return 0;
+ }
+@@ -1813,8 +1862,10 @@ ps4_run_deferred_ex(ac_drm_device *dev, uint64_t keep)
+          ps4_do_unmap(dev, d->bo, d->handle, d->addr, d->size);
+          break;
+       case 'F':
+-         if (d->bo)
++         if (d->bo) {
+             held -= MIN2(held, d->bo->size);
++            dev->deferred_bytes -= MIN2(dev->deferred_bytes, d->bo->size);
++         }
+          ps4_do_free(dev, d->bo);
+          break;
+       case 'V':
+@@ -1844,6 +1895,8 @@ ps4_defer(ac_drm_device *dev, struct ps4_deferred d)
+       dev->deferred = realloc(dev->deferred, dev->deferred_cap * sizeof(*dev->deferred));
+    }
+    dev->deferred[dev->num_deferred++] = d;
++   if (d.op == 'F' && d.bo)
++      dev->deferred_bytes += d.bo->size;
+    ps4_run_deferred(dev);
+    simple_mtx_unlock(&dev->lock);
+ }
+@@ -2588,43 +2641,82 @@ ps4_fence_at_least(ac_drm_device *dev, uint64_t seq)
+       ;
+ }
+ 
++/* one queued submission's calls (the submission thread's, or the caller's when it has none) */
++static int64_t ps4_last_submit_done;
++/* (OrbisWeb v00.38) The device whose last submission has had no sceGnmSubmitDone yet. The PS4 suspends an
++ * app (and so closes it) only once each process that used the GPU called sceGnmSubmitDone after its last
++ * submission: "Can't suspend pid: N. submitDone() is not called", then CPU_FAULT_SUBMITDONE_TIMEOUT_IN_
++ * SUSPEND_ASYNC, a crash report as the user closed OrbisWeb. The 4 ms limit below skipped the call after a
++ * burst's last submission, and an idle page submits nothing more: the submission thread makes the owed
++ * call when it runs out of work (ps4_submit_thread); without that thread every submission makes it. */
++static ac_drm_device *ps4_done_owed;
++
++static void
++ps4_run_job(struct ps4_job *job, bool every)
++{
++   ac_drm_device *dev = job->dev;
++   void *ccb[68] = {0};
++   uint32_t ccb_sizes[68] = {0};
++   int r;
++   if (job->flip)
++      r = dev->submit_and_flip(job->num_ibs, job->dcb, job->dcb_sizes, ccb, ccb_sizes, job->video,
++                               job->buffer, job->mode, job->arg);
++   else
++      r = dev->submit(job->num_ibs, job->dcb, job->dcb_sizes, ccb, ccb_sizes);
++   /* sceGnmSubmitDone tells the system the frame's work is in (it wants one at least every
++    * frame): after every flip, else at most every 4 ms */
++   const int64_t now = os_time_get_nano();
++   if (every || job->flip || now - ps4_last_submit_done >= 4000000) {
++      dev->submit_done();
++      ps4_last_submit_done = now;
++      ps4_done_owed = NULL;
++   } else {
++      ps4_done_owed = dev;
++   }
++   if (r) {
++      static unsigned logged;
++      if (logged++ < 8)
++         ps4_log("radv/ps4: %s of submission %llu = %#x (its fence written by the CPU)\n",
++                 job->flip ? "sceGnmSubmitAndFlipCommandBuffers" : "sceGnmSubmitCommandBuffers",
++                 (unsigned long long)job->seq, r);
++      ps4_fence_at_least(dev, job->seq);
++   }
++}
++
+ static void *
+ ps4_submit_thread(void *arg)
+ {
+    (void)arg;
+    ps4_boost_thread();
+-   int64_t last_done = 0;
+    for (;;) {
+       pthread_mutex_lock(&ps4_job_lock);
+-      while (ps4_job_head == ps4_job_tail)
+-         pthread_cond_wait(&ps4_job_ready, &ps4_job_lock);
++      while (ps4_job_head == ps4_job_tail) {
++         if (!ps4_done_owed) {
++            pthread_cond_wait(&ps4_job_ready, &ps4_job_lock);
++            continue;
++         }
++         /* out of work with a sceGnmSubmitDone owed: made 2 ms after the last submission */
++         struct timespec until;
++         clock_gettime(CLOCK_REALTIME, &until);
++         until.tv_nsec += 2000000;
++         if (until.tv_nsec >= 1000000000) {
++            until.tv_sec++;
++            until.tv_nsec -= 1000000000;
++         }
++         if (pthread_cond_timedwait(&ps4_job_ready, &ps4_job_lock, &until) != 0 &&
++             ps4_job_head == ps4_job_tail && ps4_done_owed) {
++            ac_drm_device *owed = ps4_done_owed;
++            ps4_done_owed = NULL;
++            pthread_mutex_unlock(&ps4_job_lock);
++            owed->submit_done();
++            ps4_last_submit_done = os_time_get_nano();
++            pthread_mutex_lock(&ps4_job_lock);
++         }
++      }
+       struct ps4_job *job = &ps4_jobs[ps4_job_head % PS4_JOB_RING];
+       pthread_mutex_unlock(&ps4_job_lock);
+ 
+-      ac_drm_device *dev = job->dev;
+-      void *ccb[68] = {0};
+-      uint32_t ccb_sizes[68] = {0};
+-      int r;
+-      if (job->flip)
+-         r = dev->submit_and_flip(job->num_ibs, job->dcb, job->dcb_sizes, ccb, ccb_sizes, job->video,
+-                                  job->buffer, job->mode, job->arg);
+-      else
+-         r = dev->submit(job->num_ibs, job->dcb, job->dcb_sizes, ccb, ccb_sizes);
+-      /* sceGnmSubmitDone tells the system the frame's work is in (it wants one at least every
+-       * frame): after every flip, else at most every 4 ms */
+-      const int64_t now = os_time_get_nano();
+-      if (job->flip || now - last_done >= 4000000) {
+-         dev->submit_done();
+-         last_done = now;
+-      }
+-      if (r) {
+-         static unsigned logged;
+-         if (logged++ < 8)
+-            ps4_log("radv/ps4: %s of submission %llu = %#x (its fence written by the CPU)\n",
+-                    job->flip ? "sceGnmSubmitAndFlipCommandBuffers" : "sceGnmSubmitCommandBuffers",
+-                    (unsigned long long)job->seq, r);
+-         ps4_fence_at_least(dev, job->seq);
+-      }
++      ps4_run_job(job, false);
+ 
+       pthread_mutex_lock(&ps4_job_lock);
+       ps4_job_head++;
+@@ -2638,11 +2730,24 @@ ps4_submit_thread(void *arg)
+ static void
+ ps4_queue_job(const struct ps4_job *job)
+ {
++   static bool inline_jobs; /* the thread could not start: submissions on the caller's thread */
+    pthread_mutex_lock(&ps4_job_lock);
+    if (!ps4_job_thread_started) {
++      pthread_attr_t attr;
++      pthread_attr_init(&attr);
++      pthread_attr_setstacksize(&attr, (size_t)256 << 10);
+       pthread_t thread;
+-      pthread_create(&thread, NULL, ps4_submit_thread, NULL);
++      const int created = pthread_create(&thread, &attr, ps4_submit_thread, NULL);
++      pthread_attr_destroy(&attr);
+       ps4_job_thread_started = true;
++      inline_jobs = created != 0;
++      if (created)
++         ps4_log("radv/ps4: the submission thread did not start (%d): submitting on the caller's thread\n", created);
++   }
++   if (inline_jobs) {
++      pthread_mutex_unlock(&ps4_job_lock);
++      ps4_run_job((struct ps4_job *)job, true);
++      return;
+    }
+    while (ps4_job_tail - ps4_job_head >= PS4_JOB_RING)
+       pthread_cond_wait(&ps4_job_space, &ps4_job_lock);
+@@ -2825,9 +2930,12 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
+    const int r = 0;
+    if (seq <= 40 || seq % 1000 == 0)
+       ps4_log("radv/ps4: submit %llu: %u IBs (first %p, %u bytes) = %#x, GPU completed %llu, "
+-              "%llu memory writes checked, %u disabled\n",
++              "%llu memory writes checked, %u disabled; GPU memory %llu MiB in %llu buffers, %llu MiB "
++              "of it freed and in quarantine\n",
+               (unsigned long long)seq, num_ibs, dcb[0], dcb_sizes[0], r,
+-              (unsigned long long)ps4_completed(dev), ps4_writes_checked, ps4_bad_writes);
++              (unsigned long long)ps4_completed(dev), ps4_writes_checked, ps4_bad_writes,
++              (unsigned long long)(dev->bo_bytes >> 20), (unsigned long long)dev->bo_count,
++              (unsigned long long)(dev->deferred_bytes >> 20));
+    if (r) {
+       ps4_log("radv/ps4: sceGnmSubmitCommandBuffers(%u IBs) = %#x\n", num_ibs + 1, r);
+       dev->last_seq--;
+diff --git a/src/c11/impl/threads_posix.c b/src/c11/impl/threads_posix.c
+index 6db8c42..3dd4449 100644
+--- a/src/c11/impl/threads_posix.c
++++ b/src/c11/impl/threads_posix.c
+@@ -252,10 +252,26 @@ thrd_create(thrd_t *thr, thrd_start_t func, void *arg)
+     if (!pack) return thrd_nomem;
+     pack->func = func;
+     pack->arg = arg;
++#if defined(__PS4__)
++    /* PS4 (Wisp): the app's threads get small stacks (in Wisp's web process they come out of the
++     * flexible memory the app's processes share: 256 KiB there); Mesa's own threads compile shaders
++     * and get 1 MiB each (2 MiB in v00.10: 41 of them emptied the pool, pthread_create failed and
++     * the web process aborted). */
++    pthread_attr_t attr;
++    pthread_attr_init(&attr);
++    pthread_attr_setstacksize(&attr, (size_t)1 << 20);
++    const int created = pthread_create(thr, &attr, impl_thrd_routine, pack);
++    pthread_attr_destroy(&attr);
++    if (created != 0) {
++        free(pack);
++        return thrd_error;
++    }
++#else
+     if (pthread_create(thr, NULL, impl_thrd_routine, pack) != 0) {
+         free(pack);
+         return thrd_error;
+     }
++#endif
+     return thrd_success;
+ }
+ 
+diff --git a/src/egl/drivers/dri2/platform_surfaceless.c b/src/egl/drivers/dri2/platform_surfaceless.c
+index 8fbb9a6..66df659 100644
+--- a/src/egl/drivers/dri2/platform_surfaceless.c
++++ b/src/egl/drivers/dri2/platform_surfaceless.c
+@@ -389,8 +389,12 @@ dri2_initialize_surfaceless(_EGLDisplay *disp)
+     */
+    driver_loaded = surfaceless_probe_device(disp, disp->Options.ForceSoftware,
+                                             disp->Options.Zink);
+-   if (!driver_loaded && disp->Options.ForceSoftware) {
+-      _eglLog(_EGL_DEBUG, "Falling back to surfaceless swrast without DRM.");
++   /* PS4 (Wisp): no DRM device at all. Zink (MESA_LOADER_DRIVER_OVERRIDE=zink) runs on the app's own
++    * Vulkan driver without a DRM node, through Kopper, the way the software drivers are tried here;
++    * without this the fallback went to swrast, which is not built ("failed to create dri2 screen"). */
++   if (!driver_loaded && (disp->Options.ForceSoftware || disp->Options.Zink)) {
++      _eglLog(_EGL_DEBUG, "Falling back to surfaceless %s without DRM.",
++              disp->Options.Zink ? "zink" : "swrast");
+       driver_loaded = surfaceless_probe_device_sw(disp);
+    }
+ 
+diff --git a/src/egl/meson.build b/src/egl/meson.build
+index f9b0e34..f9eb1e0 100644
+--- a/src/egl/meson.build
++++ b/src/egl/meson.build
+@@ -200,7 +200,8 @@ egl_def = custom_target(
+   command : gen_vs_module_defs_normal_command,
+ )
+ 
+-libegl = shared_library(
++# PS4 (Wisp): static, linked into the web process with the Gallium driver library and RADV.
++libegl = static_library(
+   egl_lib_name,
+   files_egl,
+   c_args : [
+@@ -211,14 +212,8 @@ libegl = shared_library(
+   gnu_symbol_visibility : 'hidden',
+   include_directories : incs_for_egl,
+   link_with : [link_for_egl],
+-  link_args : [ld_args_bsymbolic, ld_args_gc_sections, link_args_for_egl],
+-  link_depends : [link_deps_for_egl],
+   dependencies : [deps_for_egl, dep_dl, dep_libdrm, dep_clock, dep_thread, idep_mesautil],
+-  install : true,
+-  version : egl_lib_version,
+-  soversion : egl_lib_soversion,
+-  name_prefix : host_machine.system() == 'windows' ? 'lib' : [],  # always use lib, but avoid warnings on !windows
+-  vs_module_defs : egl_def
++  install : false,
+ )
+ 
+ if with_glvnd
+diff --git a/src/gallium/auxiliary/util/u_upload_mgr.c b/src/gallium/auxiliary/util/u_upload_mgr.c
+index bd2afdd..a1d4b3d 100644
+--- a/src/gallium/auxiliary/util/u_upload_mgr.c
++++ b/src/gallium/auxiliary/util/u_upload_mgr.c
+@@ -207,6 +207,8 @@ u_upload_alloc_buffer(struct u_upload_mgr *upload, unsigned min_size, struct pip
+    if (upload->map == NULL) {
+       u_upload_release_buffer(upload);
+       pipe_resource_release(upload->pipe, upload->buffer);
++      /* PS4 (Wisp): else the next allocation hands this released buffer out as releasebuf again */
++      upload->buffer = NULL;
+       return 0;
+    }
+ 
+diff --git a/src/gallium/drivers/zink/zink_bo.c b/src/gallium/drivers/zink/zink_bo.c
+index c9e35e8..7667acf 100644
+--- a/src/gallium/drivers/zink/zink_bo.c
++++ b/src/gallium/drivers/zink/zink_bo.c
+@@ -34,6 +34,9 @@
+ #include "zink_resource.h"
+ #include "zink_screen.h"
+ #include "util/u_hash_table.h"
++#include "util/os_time.h"
++#include <stdio.h>
++#include <stdlib.h>
+ 
+ #ifdef HAVE_LIBDRM
+ #define ZINK_USE_DMABUF
+@@ -145,6 +148,10 @@ bo_destroy(struct zink_screen *screen, struct pb_buffer *pbuf)
+       zink_bo_unmap(screen, bo);
+    }
+ 
++   if (bo->mem) {
++      p_atomic_add(&screen->ps4_mem.real_bytes, -(int64_t)bo->base.base.size);
++      p_atomic_dec(&screen->ps4_mem.real_count);
++   }
+    VKSCR(FreeMemory)(screen->dev, bo->mem, NULL);
+ 
+    simple_mtx_destroy(&bo->lock);
+@@ -174,6 +181,8 @@ bo_slab_free(struct zink_screen *screen, struct pb_slab *pslab)
+    ASSERTED unsigned slab_size = slab->buffer->base.base.size;
+ 
+    assert(slab->base.num_entries * slab->base.entry_size <= slab_size);
++   p_atomic_add(&screen->ps4_mem.slab_bytes, -(int64_t)slab->buffer->base.base.size);
++   p_atomic_dec(&screen->ps4_mem.slab_count);
+    FREE(slab->entries);
+    zink_bo_unref(screen, slab->buffer);
+    FREE(slab);
+@@ -330,6 +339,8 @@ bo_create_internal(struct zink_screen *screen,
+    bo->base.base.placement = mem_type_idx;
+    bo->base.base.usage = flags;
+    bo->unique_id = p_atomic_inc_return(&screen->pb.next_bo_unique_id);
++   p_atomic_add(&screen->ps4_mem.real_bytes, (int64_t)mai.allocationSize);
++   p_atomic_inc(&screen->ps4_mem.real_count);
+ 
+    return bo;
+ 
+@@ -1374,6 +1385,8 @@ bo_slab_alloc(void *priv, unsigned mem_type_idx, unsigned entry_size, unsigned g
+ 
+    /* Wasted alignment due to slabs with 3/4 allocations being aligned to a power of two. */
+    assert(slab->base.num_entries * entry_size <= slab_size);
++   p_atomic_add(&screen->ps4_mem.slab_bytes, (int64_t)slab_size);
++   p_atomic_inc(&screen->ps4_mem.slab_count);
+ 
+    return &slab->base;
+ 
+@@ -1390,6 +1403,41 @@ bo_slab_alloc_normal(void *priv, unsigned mem_type_idx, unsigned entry_size, uns
+    return bo_slab_alloc(priv, mem_type_idx, entry_size, group_index, false);
+ }
+ 
++/* PS4 (Wisp): this screen's Vulkan memory, every 10 s from zink_flush, in the web process's log
++ * (WISP_ZINK_LOG=0 keeps it quiet). v00.44 ran out of direct memory in 2 MiB slab allocations after
++ * minutes of Star Fox 64, and nothing in the log said what held it. */
++void
++zink_ps4_report_memory(struct zink_screen *screen)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *e = getenv("WISP_ZINK_LOG");
++      on = !e || e[0] != '0';
++   }
++   if (!on)
++      return;
++   const int64_t now = os_time_get_nano();
++   const int64_t last = p_atomic_read(&screen->ps4_mem.report_time);
++   if (last && now - last < 10ll * 1000 * 1000 * 1000)
++      return;
++   if (p_atomic_cmpxchg(&screen->ps4_mem.report_time, last, now) != last)
++      return;
++   unsigned waiting = 0;
++   uint64_t past_busy = 0;
++   for (unsigned i = 0; i < NUM_SLAB_ALLOCATORS; i++) {
++      waiting += p_atomic_read(&screen->pb.bo_slabs[i].num_reclaim);
++      past_busy += p_atomic_read(&screen->pb.bo_slabs[i].full_walk_reclaims);
++   }
++   fprintf(stderr, "zink (Wisp): screen %p: %llu MiB in %llu Vulkan allocations; %llu slabs (%llu MiB) for "
++           "buffers and images up to 1 MiB, %u of their entries freed and waiting for the GPU (%llu "
++           "found past busy ones); %llu MiB of freed allocations cached\n",
++           (void *)screen, (unsigned long long)(p_atomic_read(&screen->ps4_mem.real_bytes) >> 20),
++           (unsigned long long)p_atomic_read(&screen->ps4_mem.real_count),
++           (unsigned long long)p_atomic_read(&screen->ps4_mem.slab_count),
++           (unsigned long long)(p_atomic_read(&screen->ps4_mem.slab_bytes) >> 20), waiting,
++           (unsigned long long)past_busy, (unsigned long long)(screen->pb.bo_cache.cache_size >> 20));
++}
++
+ bool
+ zink_bo_init(struct zink_screen *screen)
+ {
+diff --git a/src/gallium/drivers/zink/zink_bo.h b/src/gallium/drivers/zink/zink_bo.h
+index b78a1a2..beeb070 100644
+--- a/src/gallium/drivers/zink/zink_bo.h
++++ b/src/gallium/drivers/zink/zink_bo.h
+@@ -110,6 +110,10 @@ zink_bo_init(struct zink_screen *screen);
+ void
+ zink_bo_deinit(struct zink_screen *screen);
+ 
++/* PS4 (Wisp): this screen's Vulkan memory in the log, every 10 s (zink_flush) */
++void
++zink_ps4_report_memory(struct zink_screen *screen);
++
+ struct pb_buffer *
+ zink_bo_create(struct zink_screen *screen, uint64_t size, unsigned alignment, enum zink_heap heap, enum zink_alloc_flag flags, unsigned mem_type_idx, const void *pNext);
+ 
+diff --git a/src/gallium/drivers/zink/zink_context.c b/src/gallium/drivers/zink/zink_context.c
+index 5bc200c..e96dab1 100644
+--- a/src/gallium/drivers/zink/zink_context.c
++++ b/src/gallium/drivers/zink/zink_context.c
+@@ -1367,6 +1367,16 @@ resource_release(struct zink_context *ctx, struct zink_resource *res)
+    zink_resource_reference(&res, NULL);
+ }
+ 
++/* PS4 (Wisp): the release that waited for the last unbind. deleted stayed set after it, so a buffer bound again
++ * by another holder of a reference was released a second time at its next unbind: one reference too many, and
++ * the buffer was freed under its holder */
++ALWAYS_INLINE static void
++resource_release_deferred(struct zink_context *ctx, struct zink_resource *res)
++{
++   res->deleted = false;
++   resource_release(ctx, res);
++}
++
+ ALWAYS_INLINE static void
+ update_img_bind_count(struct zink_context *ctx, struct zink_resource *res, bool is_compute, bool decrement)
+ {
+@@ -1395,7 +1405,7 @@ update_buf_bind_count(struct zink_context *ctx, struct zink_resource *res, bool
+       unsigned all_binds = p_atomic_add_return(&res->all_binds, -incr);
+       /* if hit while blitting, this will be triggered again after blitting */
+       if (res->deleted && !all_binds && !ctx->blitting)
+-         resource_release(ctx, res);
++         resource_release_deferred(ctx, res);
+    } else
+       p_atomic_inc(&res->bind_count[is_compute]);
+ }
+@@ -4247,6 +4257,9 @@ zink_flush(struct pipe_context *pctx,
+    struct zink_screen *screen = zink_screen(ctx->base.screen);
+    VkSemaphore export_sem = VK_NULL_HANDLE;
+ 
++   /* PS4 (Wisp): this screen's memory in the log, every 10 s */
++   zink_ps4_report_memory(screen);
++
+    /* triggering clears will force state->has_work */
+    if (!deferred && ctx->clears_enabled) {
+       /* if fbfetch outputs are active, disable them when flushing clears */
+@@ -6093,6 +6106,15 @@ zink_update_barriers(struct zink_context *ctx, bool is_compute,
+    ASSERTED bool check_rp = ctx->in_rp && ctx->dynamic_fb.tc_info.zsbuf_invalidate;
+    set_foreach(need_barriers, he) {
+       struct zink_resource *res = (struct zink_resource *)he->key;
++      if (unlikely(res->live != ZINK_RESOURCE_LIVE || !res->obj)) {
++         /* PS4 (Wisp): freed while it sat here (released through another context), or live with its object
++          * gone (v00.34: Star Fox 64's WebGL, zink_resource_image_barrier reading res->obj NULL) */
++         zink_ps4_note_stale_barrier(ctx, res);
++         _mesa_set_remove(need_barriers, he);
++         if (!need_barriers->entries)
++            break;
++         continue;
++      }
+       if (res->bind_count[is_compute]) {
+          VkPipelineStageFlagBits pipeline = is_compute ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : res->gfx_barrier;
+          if (res->base.b.target == PIPE_BUFFER) {
+diff --git a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/zink_resource.c
+index 404dd0e..2506c6f 100644
+--- a/src/gallium/drivers/zink/zink_resource.c
++++ b/src/gallium/drivers/zink/zink_resource.c
+@@ -247,12 +247,84 @@ zink_destroy_resource_object(struct zink_screen *screen, struct zink_resource_ob
+    FREE(obj);
+ }
+ 
++/* PS4 (Wisp): since Mesa 26 a context's binds of a buffer take no reference (pipe_context::resource_release), and
++ * the GPU web process crashed in zink_update_barriers reading a freed resource (res->obj NULL) on YouTube. Guards:
++ * - zink_resource_destroy keeps a buffer that a context still has bound, as a release waiting for its last unbind;
++ * - zink_resource::live lets zink_update_barriers drop a resource that was freed while it sat in the context's
++ *   barrier set (resource_release takes it out of the releasing context's sets only).
++ * Both say so in the web process's log (the first 8 times, then every 64th), with the code address that dropped
++ * the last reference (minus the image base, "text at" in the kit's boot trace: llvm-symbolizer); WISP_ZINK_LOG=0
++ * keeps them quiet. */
++#include <stdio.h>
++#include <stdlib.h>
++
++static bool
++zink_ps4_log_on(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *e = getenv("WISP_ZINK_LOG");
++      on = !e || e[0] != '0';
++   }
++   return on;
++}
++
++/* the last resources freed and where from (the caller that dropped the last reference) */
++static struct {
++   const void *res;
++   const void *where;
++} zink_ps4_freed[512];
++static unsigned zink_ps4_freed_next;
++
++void
++zink_ps4_note_stale_barrier(const struct zink_context *ctx, const struct zink_resource *res)
++{
++   static unsigned count;
++   unsigned n = p_atomic_inc_return(&count);
++   if (!zink_ps4_log_on() || (n > 8 && n % 64))
++      return;
++   const void *where = NULL;
++   unsigned last = p_atomic_read(&zink_ps4_freed_next);
++   for (unsigned i = 0; i < ARRAY_SIZE(zink_ps4_freed); i++) {
++      unsigned idx = (last - i) % ARRAY_SIZE(zink_ps4_freed);
++      if (zink_ps4_freed[idx].res == res) {
++         where = zink_ps4_freed[idx].where;
++         break;
++      }
++   }
++   fprintf(stderr, "zink (Wisp): context %p had freed resource %p in its barrier set (freed from %p): skipped (%u so far)\n",
++           (const void *)ctx, (const void *)res, where, n);
++}
++
++static void
++zink_ps4_note_bound_destroy(const struct zink_resource *res, const void *where)
++{
++   static unsigned count;
++   unsigned n = p_atomic_inc_return(&count);
++   if (!zink_ps4_log_on() || (n > 8 && n % 64))
++      return;
++   fprintf(stderr, "zink (Wisp): buffer %p (%u bytes) lost its last reference while bound (%u gfx, %u compute binds; dropped from %p): kept until unbound (%u so far)\n",
++           (const void *)res, res->base.b.width0, res->bind_count[0], res->bind_count[1], where, n);
++}
++
+ static void
+ zink_resource_destroy(struct pipe_screen *pscreen,
+                       struct pipe_resource *pres)
+ {
+    struct zink_screen *screen = zink_screen(pscreen);
+    struct zink_resource *res = zink_resource(pres);
++   if (unlikely(pres->target == PIPE_BUFFER && p_atomic_read(&res->all_binds))) {
++      /* PS4 (Wisp): still bound somewhere: the unbind that takes the count to 0 releases it */
++      zink_ps4_note_bound_destroy(res, __builtin_return_address(0));
++      p_atomic_set(&res->base.b.reference.count, 1);
++      res->deleted = true;
++      return;
++   }
++   {
++      unsigned idx = p_atomic_inc_return(&zink_ps4_freed_next) % ARRAY_SIZE(zink_ps4_freed);
++      zink_ps4_freed[idx].res = res;
++      zink_ps4_freed[idx].where = __builtin_return_address(0);
++   }
+    /* prevent double-free when unrefing internal surfaces */
+    res->base.b.reference.count = 999;
+    if (pres->target == PIPE_BUFFER) {
+@@ -265,6 +337,7 @@ zink_resource_destroy(struct pipe_screen *pscreen,
+    pipe_resource_reference(&pres_transient, NULL);
+    zink_resource_object_reference(screen, &res->obj, NULL);
+    threaded_resource_deinit(pres);
++   res->live = 0;
+    FREE_CL(res);
+ }
+ 
+@@ -1585,6 +1658,7 @@ resource_create(struct pipe_screen *pscreen,
+       mesa_loge("ZINK: failed to allocate res!");
+       return NULL;
+    }
++   res->live = ZINK_RESOURCE_LIVE;
+ 
+    if (modifiers_count > 0 && screen->info.have_EXT_image_drm_format_modifier) {
+       /* for rebinds */
+@@ -2421,6 +2495,11 @@ zink_buffer_map(struct pipe_context *pctx,
+             trans->offset = offset;
+          }
+          res = zink_resource(trans->staging_res);
++         /* PS4 (Wisp): no staging buffer (out of memory: pipe_buffer_create or the uploader failed) fails the map;
++          * it went on and read res->so_valid through NULL (v00.43: Skia's uploads and a WebGL context's first
++          * subdata crashed the web process once direct memory ran out) */
++         if (!res)
++            goto fail;
+          usage |= PIPE_MAP_UNSYNCHRONIZED;
+          map_offset = trans->offset;
+          ptr = ((uint8_t *)ptr);
+@@ -2577,6 +2656,24 @@ zink_image_map(struct pipe_context *pctx,
+                                                          trans->base.b.stride,
+                                                          box->height);
+ 
++      /* PS4 (Wisp): a write-only map takes its staging space from the stream uploader, as a buffer map
++       * does (the copy into the image starts at trans->offset): a new staging resource for every texture
++       * upload cost a Vulkan buffer and its memory each, and a page's texture uploads held its main thread
++       * for seconds (v00.41: Crash Bash's Babylon.js, Star Fox's N64 core) */
++      if (!(usage & PIPE_MAP_READ)) {
++         struct u_upload_mgr *mgr = (usage & TC_TRANSFER_MAP_THREADED_UNSYNC) ? ctx->tc->base.stream_uploader
++                                                                         : ctx->base.stream_uploader;
++         unsigned offset = 0;
++         ptr = NULL;
++         u_upload_alloc_ref(mgr, 0, trans->base.b.layer_stride * box->depth,
++                            MAX2(screen->info.props.limits.minMemoryMapAlignment, 16), &offset,
++                            (struct pipe_resource **)&trans->staging_res, &ptr);
++         if (!ptr || !trans->staging_res)
++            goto fail;
++         trans->offset = offset;
++         goto staged;
++      }
++
+       struct pipe_resource templ = *pres;
+       templ.next = NULL;
+       templ.format = format;
+@@ -2606,6 +2703,7 @@ zink_image_map(struct pipe_context *pctx,
+       }
+ 
+       ptr = map_resource(screen, staging_res);
++staged:;
+    } else {
+       assert(res->linear);
+       ptr = map_resource(screen, res);
+diff --git a/src/gallium/drivers/zink/zink_resource.h b/src/gallium/drivers/zink/zink_resource.h
+index fbd0674..a68838e 100644
+--- a/src/gallium/drivers/zink/zink_resource.h
++++ b/src/gallium/drivers/zink/zink_resource.h
+@@ -223,6 +223,10 @@ zink_resource_reference(struct zink_resource **d, struct zink_resource *s)
+ void
+ zink_destroy_resource_surface_cache(struct zink_screen *screen, struct set *ht, bool is_buffer);
+ 
++/* PS4 (Wisp): a freed resource found in a context's barrier set (said in the log unless WISP_ZINK_LOG=0) */
++void
++zink_ps4_note_stale_barrier(const struct zink_context *ctx, const struct zink_resource *res);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index 52db93b..4b7d547 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -3683,8 +3683,14 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
+          mesa_loge("ZINK: failed to initialize disk cache");
+       goto fail;
+    }
++#if defined(__PS4__)
++   /* PS4 (Wisp): one thread (stacks come out of the memory the app's processes share) */
++   if (!util_queue_init(&screen->cache_get_thread, "zcfq", 8, 1,
++                        UTIL_QUEUE_INIT_RESIZE_IF_FULL, screen))
++#else
+    if (!util_queue_init(&screen->cache_get_thread, "zcfq", 8, 4,
+                         UTIL_QUEUE_INIT_RESIZE_IF_FULL, screen))
++#endif
+       goto fail;
+    populate_format_props(screen);
+ 
+diff --git a/src/gallium/drivers/zink/zink_synchronization.cpp b/src/gallium/drivers/zink/zink_synchronization.cpp
+index c38a105..7524bd0 100644
+--- a/src/gallium/drivers/zink/zink_synchronization.cpp
++++ b/src/gallium/drivers/zink/zink_synchronization.cpp
+@@ -415,6 +415,11 @@ template <barrier_type BARRIER_API, bool UNSYNCHRONIZED, bool GENERAL>
+ void
+ zink_resource_image_barrier(struct zink_context *ctx, struct zink_resource *res, VkImageLayout new_layout, VkAccessFlags flags, VkPipelineStageFlags pipeline)
+ {
++   /* PS4 (Wisp): a resource whose object is gone has nothing to transition (v00.34: a WebGL game's crash) */
++   if (unlikely(!res->obj)) {
++      zink_ps4_note_stale_barrier(ctx, res);
++      return;
++   }
+    bool is_write = zink_resource_access_is_write(flags);
+    if (is_write && zink_is_swapchain(res))
+       zink_kopper_set_readback_needs_update(res);
+@@ -589,6 +594,11 @@ template <barrier_type BARRIER_API, bool UNSYNCHRONIZED, bool GENERAL_IMAGE>
+ void
+ zink_resource_memory_barrier(struct zink_context *ctx, struct zink_resource *res, VkAccessFlags flags, VkPipelineStageFlags pipeline)
+ {
++   /* PS4 (Wisp): as the image barrier above */
++   if (unlikely(!res->obj)) {
++      zink_ps4_note_stale_barrier(ctx, res);
++      return;
++   }
+    bool is_write = zink_resource_access_is_write(flags);
+    bool has_usage = zink_resource_has_usage(res);
+    bool completed = !has_usage || zink_resource_usage_check_completion_fast(zink_screen(ctx->base.screen), res, ZINK_RESOURCE_ACCESS_RW);
+diff --git a/src/gallium/drivers/zink/zink_types.h b/src/gallium/drivers/zink/zink_types.h
+index f948c46..418756e 100644
+--- a/src/gallium/drivers/zink/zink_types.h
++++ b/src/gallium/drivers/zink/zink_types.h
+@@ -1255,6 +1255,10 @@ struct zink_resource_object {
+    bool immutable_handle;
+ };
+ 
++/* PS4 (Wisp): zink_resource::live holds this while the resource exists (zink_resource_destroy clears it), so a
++ * resource freed while it still sits in a context's barrier set is recognized there and dropped unread */
++#define ZINK_RESOURCE_LIVE 0x5a524c56u
++
+ /* "gfx" includes mesh here */
+ struct zink_resource {
+    struct threaded_resource base;
+@@ -1262,6 +1266,7 @@ struct zink_resource {
+    enum pipe_format internal_format:16;
+ 
+    struct zink_resource_object *obj;
++   uint32_t live; /* ZINK_RESOURCE_LIVE (PS4) */
+    struct zink_resource *transient; //for msrtt without EXT_multisampled_render_to_single_sampled and format view shadowing
+    uint32_t queue;
+    union {
+@@ -1312,7 +1317,7 @@ struct zink_resource {
+    bool use_damage;
+ 
+    bool copies_warned;
+-   bool deleted; //resource_release
++   bool deleted; //resource_release (PS4: cleared when that release happens, see resource_release_deferred)
+    bool swapchain;
+    bool dmabuf;
+    bool unflushed_transient; //format view transient has newer data than parent
+@@ -1428,6 +1433,11 @@ struct zink_screen {
+       unsigned min_alloc_size;
+       uint32_t next_bo_unique_id;
+    } pb;
++   /* PS4 (Wisp): this screen's Vulkan memory and slabs, for its line in the log (zink_ps4_report_memory) */
++   struct {
++      uint64_t real_bytes, real_count, slab_bytes, slab_count;
++      int64_t report_time;
++   } ps4_mem;
+    uint8_t heap_map[ZINK_HEAP_MAX][VK_MAX_MEMORY_TYPES];  // mapping from zink heaps to memory type indices
+    uint8_t heap_count[ZINK_HEAP_MAX];  // number of memory types per zink heap
+    bool resizable_bar;
+diff --git a/src/gallium/targets/dri/meson.build b/src/gallium/targets/dri/meson.build
+index 412239f..f39d1a3 100644
+--- a/src/gallium/targets/dri/meson.build
++++ b/src/gallium/targets/dri/meson.build
+@@ -37,7 +37,8 @@ else
+   libgallium_name = 'gallium-@0@'.format(meson.project_version())
+ endif
+ 
+-libgallium_dri = shared_library(
++# PS4 (Wisp): static (see src/egl/meson.build)
++libgallium_dri = static_library(
+   libgallium_name,
+   files('dri_target.c'),
+   include_directories : [
+@@ -45,8 +46,6 @@ libgallium_dri = shared_library(
+     inc_gallium_winsys, include_directories('../../frontends/dri'),
+   ],
+   gnu_symbol_visibility : 'hidden',
+-  link_args : [ld_args_build_id, ld_args_gc_sections, gallium_dri_ld_args],
+-  link_depends : gallium_dri_link_depends,
+   link_with : [
+     libmesa, libgalliumvl,
+     libgallium, libglapi, libpipe_loader_static, libws_null, libwsw, libswdri,
+@@ -61,8 +60,7 @@ libgallium_dri = shared_library(
+     driver_panfrost, driver_iris, driver_lima, driver_zink, driver_d3d12,
+     driver_asahi, driver_crocus, driver_rocket, driver_ethosu
+   ],
+-  install : true,
+-  name_suffix : libname_suffix,
++  install : false,
+ )
+ 
+ shared_glapi_lib = libgallium_dri
+diff --git a/src/mesa/state_tracker/st_atom_constbuf.c b/src/mesa/state_tracker/st_atom_constbuf.c
+index 737372e..c7b876f 100644
+--- a/src/mesa/state_tracker/st_atom_constbuf.c
++++ b/src/mesa/state_tracker/st_atom_constbuf.c
+@@ -135,6 +135,11 @@ st_upload_constants(struct st_context *st, struct gl_program *prog, mesa_shader_
+           */
+          u_upload_alloc(pipe->const_uploader, 0, paramBytes + 12,
+             alignment, &cb.buffer_offset, &cb.buffer, &releasebuf, (void**)&ptr);
++         /* PS4 (Wisp): no upload buffer (out of GPU memory): the draw keeps the constants bound
++          * before instead of writing these through NULL (v00.44: Star Fox 64's WebGL crashed the web
++          * process here, long after the direct memory had run out) */
++         if (!ptr)
++            goto constants_done;
+ 
+          int uniform_bytes = params->UniformBytes;
+          if (uniform_bytes)
+@@ -204,6 +209,7 @@ st_upload_constants(struct st_context *st, struct gl_program *prog, mesa_shader_
+          }
+       }
+ 
++constants_done:
+       st->state.constbuf0_enabled_shader_mask |= 1 << stage;
+    } else {
+       st_unbind_unused_cb0(st, stage);
+diff --git a/src/util/disk_cache.c b/src/util/disk_cache.c
+index 6c26acc..f0aa884 100644
+--- a/src/util/disk_cache.c
++++ b/src/util/disk_cache.c
+@@ -87,7 +87,13 @@ disk_cache_init_queue(struct disk_cache *cache)
+     * The queue will resize automatically when it's full, so adding new jobs
+     * doesn't stall.
+     */
++#if defined(__PS4__)
++   /* PS4 (Wisp): one thread (each thread's stack comes out of the memory the app's processes share,
++    * and a web process opens three caches) */
++   return util_queue_init(&cache->cache_queue, "disk$", 32, 1,
++#else
+    return util_queue_init(&cache->cache_queue, "disk$", 32, 4,
++#endif
+                           UTIL_QUEUE_INIT_RESIZE_IF_FULL |
+                           UTIL_QUEUE_INIT_USE_MINIMUM_PRIORITY |
+                           UTIL_QUEUE_INIT_SET_FULL_THREAD_AFFINITY, NULL);
+diff --git a/src/util/futex.c b/src/util/futex.c
+index df3e949..f839162 100644
+--- a/src/util/futex.c
++++ b/src/util/futex.c
+@@ -26,7 +26,59 @@
+ 
+ #if UTIL_FUTEX_SUPPORTED
+ 
+-#if defined(HAVE_LINUX_FUTEX_H)
++#if defined(__PS4__)
++
++/* PS4 (OrbisWeb v00.37): the kernel's umtx wait and wake, through libkernel's _umtx_op export
++ * (OpenOrbis has no <sys/umtx.h>; the operation numbers are FreeBSD's, present since 8.0).
++ *
++ * Without futexes, every simple_mtx was a pthread mutex and every util_queue_fence a pthread mutex and
++ * condition variable. The PS4 makes those objects from a small internal pool in each process: a WebGL
++ * emulator (Star Fox 64 in EmulatorJS) made Zink and the threaded context create thousands of them
++ * (shaders, programs, pipelines, buffers, textures; several are never destroyed when futexes are
++ * missing), the pool ran out ("[ScePthread/System] Internal Memory is running out"), GStreamer's clock
++ * could not make its next mutex, and its g_error ended the process with SIGTRAP. Futexes are plain
++ * 32-bit words: no kernel object at all.
++ *
++ * Timeouts: Mesa passes an absolute CLOCK_MONOTONIC time; the kernel gets a relative timespec, which
++ * FreeBSD 9 (the PS4's base) and later both read when uaddr is its size. */
++
++#include <errno.h>
++#include <stdint.h>
++#include <time.h>
++
++int _umtx_op(void *obj, int op, unsigned long val, void *uaddr, void *uaddr2);
++
++#define PS4_UMTX_OP_WAIT_UINT_PRIVATE 15
++#define PS4_UMTX_OP_WAKE_PRIVATE 16
++
++int futex_wake(uint32_t *addr, int32_t count)
++{
++   return _umtx_op(addr, PS4_UMTX_OP_WAKE_PRIVATE, (unsigned long)(uint32_t)count, NULL, NULL) == -1 ? errno : 0;
++}
++
++int futex_wait(uint32_t *addr, int32_t value, const struct timespec *timeout)
++{
++   struct timespec relative;
++   void *uaddr = NULL, *uaddr2 = NULL;
++
++   if (timeout != NULL) {
++      struct timespec now;
++      clock_gettime(CLOCK_MONOTONIC, &now);
++      int64_t ns = (int64_t)(timeout->tv_sec - now.tv_sec) * 1000000000 + (timeout->tv_nsec - now.tv_nsec);
++      if (ns <= 0)
++         return ETIMEDOUT;
++      relative.tv_sec = (time_t)(ns / 1000000000);
++      relative.tv_nsec = (long)(ns % 1000000000);
++      uaddr = (void *)(uintptr_t)sizeof(relative);
++      uaddr2 = &relative;
++   }
++
++   return _umtx_op(addr, PS4_UMTX_OP_WAIT_UINT_PRIVATE, (unsigned long)(uint32_t)value, uaddr, uaddr2) == -1
++             ? errno
++             : 0;
++}
++
++#elif defined(HAVE_LINUX_FUTEX_H)
+ 
+ #include <limits.h>
+ #include <stdint.h>
+diff --git a/src/util/futex.h b/src/util/futex.h
+index 319f02e..f5dd082 100644
+--- a/src/util/futex.h
++++ b/src/util/futex.h
+@@ -31,6 +31,9 @@
+ #define UTIL_FUTEX_SUPPORTED 1
+ #elif defined(__FreeBSD__) && !defined(__PS4__)
+ #define UTIL_FUTEX_SUPPORTED 1
++#elif defined(__PS4__)
++/* PS4 (OrbisWeb): the kernel's umtx wait and wake through libkernel's _umtx_op (futex.c) */
++#define UTIL_FUTEX_SUPPORTED 1
+ #elif defined(__OpenBSD__)
+ #define UTIL_FUTEX_SUPPORTED 1
+ #elif defined(_WIN32) && !defined(WINDOWS_NO_FUTEX)
+diff --git a/src/util/pb_slab.c b/src/util/pb_slab.c
+index 24f4d34..af54598 100644
+--- a/src/util/pb_slab.c
++++ b/src/util/pb_slab.c
+@@ -29,6 +29,7 @@
+ 
+ #include "util/u_math.h"
+ #include "util/u_memory.h"
++#include "util/os_time.h"
+ 
+ /* All slab allocations from the same heap and with the same size belong
+  * to the same group.
+@@ -56,6 +57,7 @@ pb_slab_reclaim(struct pb_slabs *slabs, struct pb_slab_entry *entry)
+    struct pb_slab *slab = entry->slab;
+ 
+    list_del(&entry->head); /* remove from reclaim list */
++   slabs->num_reclaim--;
+    list_add(&entry->head, &slab->free);
+    slab->num_free++;
+ 
+@@ -73,6 +75,9 @@ pb_slab_reclaim(struct pb_slabs *slabs, struct pb_slab_entry *entry)
+ 
+ #define MAX_FAILED_RECLAIMS 2
+ 
++static unsigned
++pb_slabs_reclaim_all_locked(struct pb_slabs *slabs);
++
+ static unsigned
+ pb_slabs_reclaim_locked(struct pb_slabs *slabs)
+ {
+@@ -95,6 +100,22 @@ pb_slabs_reclaim_locked(struct pb_slabs *slabs)
+          break;
+       }
+    }
++#if defined(__PS4__)
++   /* PS4 (Wisp): the walk above stops at the second entry still busy, as entries mostly become free
++    * in the order they were freed. One that stays busy for long (its batch not flushed: an idle
++    * context) holds back every entry freed after it, and their slabs (2 MiB each): v00.44 ran out of
++    * direct memory in 2 MiB allocations after minutes of Star Fox 64. With more than 1024 entries
++    * waiting, all of them are walked, at most every 250 ms. */
++   if (num_failed_reclaims >= MAX_FAILED_RECLAIMS && slabs->num_reclaim > 1024) {
++      const int64_t now = os_time_get_nano();
++      if (now - slabs->last_full_walk > 250 * 1000 * 1000ll) {
++         slabs->last_full_walk = now;
++         const unsigned found = pb_slabs_reclaim_all_locked(slabs);
++         slabs->full_walk_reclaims += found;
++         num_reclaims += found;
++      }
++   }
++#endif
+    return num_reclaims;
+ }
+ 
+@@ -212,6 +233,7 @@ pb_slab_free(struct pb_slabs* slabs, struct pb_slab_entry *entry)
+ {
+    simple_mtx_lock(&slabs->mutex);
+    list_addtail(&entry->head, &slabs->reclaim);
++   slabs->num_reclaim++;
+    simple_mtx_unlock(&slabs->mutex);
+ }
+ 
+@@ -264,6 +286,9 @@ pb_slabs_init(struct pb_slabs *slabs,
+    slabs->slab_free = slab_free;
+ 
+    list_inithead(&slabs->reclaim);
++   slabs->num_reclaim = 0;
++   slabs->last_full_walk = 0;
++   slabs->full_walk_reclaims = 0;
+ 
+    num_groups = slabs->num_orders * slabs->num_heaps *
+                 (1 + allow_three_fourth_allocations);
+diff --git a/src/util/pb_slab.h b/src/util/pb_slab.h
+index 7ef7c5d..8ca1c8f 100644
+--- a/src/util/pb_slab.h
++++ b/src/util/pb_slab.h
+@@ -131,6 +131,12 @@ struct pb_slabs
+    slab_can_reclaim_fn *can_reclaim;
+    slab_alloc_fn *slab_alloc;
+    slab_free_fn *slab_free;
++
++   /* PS4 (Wisp): entries in the reclaim list; when all of them were last walked (os_time_get_nano),
++    * and the entries such walks found past busy ones (pb_slabs_reclaim_locked) */
++   unsigned num_reclaim;
++   int64_t last_full_walk;
++   uint64_t full_walk_reclaims;
+ };
+ 
+ struct pb_slab_entry *
+diff --git a/src/util/rwlock.c b/src/util/rwlock.c
+index 1d215d3..ff3e1ba 100644
+--- a/src/util/rwlock.c
++++ b/src/util/rwlock.c
+@@ -7,6 +7,81 @@
+ #include <assert.h>
+ #include "rwlock.h"
+ 
++#if defined(__PS4__)
++/* PS4 (Wisp): see rwlock.h. Readers count up in `state`; a writer holds it alone (U_RWLOCK_WRITER). A thread
++ * that cannot have it waits on the futex for `state` to change; `waiters` only spares the unlocks a wake when
++ * nobody waits (a waiter announces itself before it compares, so no wake is lost). Readers go first: a
++ * reader that already holds it never waits behind a writer. */
++#include "futex.h"
++#include <limits.h>
++
++#define U_RWLOCK_WRITER 0x80000000u
++
++int u_rwlock_init(struct u_rwlock *rwlock)
++{
++   __atomic_store_n(&rwlock->state, 0, __ATOMIC_RELAXED);
++   __atomic_store_n(&rwlock->waiters, 0, __ATOMIC_RELAXED);
++   return 0;
++}
++
++int u_rwlock_destroy(struct u_rwlock *rwlock)
++{
++   (void)rwlock;
++   return 0;
++}
++
++static void u_rwlock_wait(struct u_rwlock *rwlock, uint32_t seen)
++{
++   __atomic_fetch_add(&rwlock->waiters, 1, __ATOMIC_SEQ_CST);
++   futex_wait(&rwlock->state, (int32_t)seen, NULL);
++   __atomic_fetch_sub(&rwlock->waiters, 1, __ATOMIC_SEQ_CST);
++}
++
++static void u_rwlock_wake(struct u_rwlock *rwlock)
++{
++   if (__atomic_load_n(&rwlock->waiters, __ATOMIC_SEQ_CST))
++      futex_wake(&rwlock->state, INT32_MAX);
++}
++
++int u_rwlock_rdlock(struct u_rwlock *rwlock)
++{
++   for (;;) {
++      uint32_t state = __atomic_load_n(&rwlock->state, __ATOMIC_RELAXED);
++      if (!(state & U_RWLOCK_WRITER)) {
++         if (__atomic_compare_exchange_n(&rwlock->state, &state, state + 1, 1, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
++            return 0;
++         continue;
++      }
++      u_rwlock_wait(rwlock, state);
++   }
++}
++
++int u_rwlock_rdunlock(struct u_rwlock *rwlock)
++{
++   if (__atomic_sub_fetch(&rwlock->state, 1, __ATOMIC_SEQ_CST) == 0)
++      u_rwlock_wake(rwlock);
++   return 0;
++}
++
++int u_rwlock_wrlock(struct u_rwlock *rwlock)
++{
++   for (;;) {
++      uint32_t state = 0;
++      if (__atomic_compare_exchange_n(&rwlock->state, &state, U_RWLOCK_WRITER, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
++         return 0;
++      u_rwlock_wait(rwlock, state);
++   }
++}
++
++int u_rwlock_wrunlock(struct u_rwlock *rwlock)
++{
++   __atomic_store_n(&rwlock->state, 0, __ATOMIC_SEQ_CST);
++   u_rwlock_wake(rwlock);
++   return 0;
++}
++
++#else
++
+ #if defined(_WIN32) && !defined(HAVE_PTHREAD)
+ #include <windows.h>
+ static_assert(sizeof(struct u_rwlock) == sizeof(SRWLOCK),
+@@ -71,3 +146,5 @@ int u_rwlock_wrunlock(struct u_rwlock *rwlock)
+    return pthread_rwlock_unlock(&rwlock->rwlock);
+ #endif
+ }
++
++#endif /* !__PS4__ */
+diff --git a/src/util/rwlock.h b/src/util/rwlock.h
+index f97a829..ee500fc 100644
+--- a/src/util/rwlock.h
++++ b/src/util/rwlock.h
+@@ -31,6 +31,7 @@
+ #if defined(HAVE_PTHREAD)
+ #include <pthread.h>
+ #endif
++#include <stdint.h>
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -38,7 +39,13 @@ extern "C" {
+ 
+ struct u_rwlock
+ {
+-#if defined(_WIN32) && !defined(HAVE_PTHREAD)
++#if defined(__PS4__)
++   /* PS4 (Wisp): a reader-writer lock on the kernel's futex (util/futex.h). A pthread read-write lock is a
++    * kernel object there, and each kept ~62 bytes of the process's internal memory after it was destroyed:
++    * Zink makes one for every resource object, and a page's texture uploads emptied the pool (v00.41's census) */
++   uint32_t state;     /* the readers, or U_RWLOCK_WRITER */
++   uint32_t waiters;
++#elif defined(_WIN32) && !defined(HAVE_PTHREAD)
+    struct {
+       void *Ptr;
+    } rwlock;

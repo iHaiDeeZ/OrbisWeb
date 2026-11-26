@@ -1,0 +1,234 @@
+From 8a70757c2712dacd9718078b01b509a19bac0f68 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Thu, 26 Nov 2026 01:47:54 +0300
+Subject: [PATCH] PS4 (Wisp): Web Audio decodes WAV itself, and on more threads
+
+decodeAudioData ran every file through its own GStreamer pipeline, on a thread made for it, one file
+after another on the context's one decoder thread. Crash Bash online's sound effects and its music
+banks' samples are a few hundred short WAV files; on the PS4 its sound was missing for ~100 s while a
+level's files were decoded (v00.42).
+
+- WAV (integer PCM of 8, 16, 24 or 32 bits, float of 32 or 64, WAVE_FORMAT_EXTENSIBLE of those; chunks
+  in any order, a data size past the end read as far as it goes) is read without GStreamer and
+  resampled to the context's rate with AudioBus::createBySampleRateConverting, as GStreamer's
+  audioresample did. Other formats and WAVs it does not read go to GStreamer as before.
+- Decodes take turns on three more "Audio Decoder (PS4)" threads besides the context's own.
+- web.log: the first six decodes one by one, then every 32nd with totals (WISP_AUDIO_LOG=0: none).
+
+The reader was tested on the PC with ASan/UBSan against 8/16/24/32-bit, float 32/64, extensible,
+6-channel, data-before-fmt, odd-sized chunk, truncated and resampled files, and rejects (A-law, Ogg,
+short).
+---
+ .../Modules/webaudio/AsyncAudioDecoder.cpp    |  29 ++++
+ .../gstreamer/AudioFileReaderGStreamer.cpp    | 129 ++++++++++++++++++
+ 2 files changed, 158 insertions(+)
+
+diff --git a/Source/WebCore/Modules/webaudio/AsyncAudioDecoder.cpp b/Source/WebCore/Modules/webaudio/AsyncAudioDecoder.cpp
+index b50bc45d..be685dcb 100644
+--- a/Source/WebCore/Modules/webaudio/AsyncAudioDecoder.cpp
++++ b/Source/WebCore/Modules/webaudio/AsyncAudioDecoder.cpp
+@@ -33,6 +33,11 @@
+ #include <JavaScriptCore/TypedArrayAdaptors.h>
+ #include <wtf/NativePromise.h>
+ #include <wtf/TZoneMallocInlines.h>
++#if defined(__ORBIS__)
++#include <atomic>
++#include <mutex>
++#include <wtf/Vector.h>
++#endif
+ 
+ namespace WebCore {
+ 
+@@ -50,9 +55,33 @@ AsyncAudioDecoder::~AsyncAudioDecoder()
+     });
+ }
+ 
++#if defined(__ORBIS__)
++// PS4 (Wisp): three decoding threads for all contexts, taking turns, besides each context's own: a
++// GStreamer decode mostly waits on its pipeline's threads, and a page decoding many files at once (a game's
++// sounds) had them done one after another on one thread (v00.42)
++static RunLoop& wispDecoderRunLoop(RunLoop& own)
++{
++    static constexpr unsigned extra = 3;
++    static std::once_flag once;
++    static Vector<Ref<RunLoop>>* loops;
++    std::call_once(once, [] {
++        loops = new Vector<Ref<RunLoop>>;   // (kept for the process's life)
++        for (unsigned i = 0; i < extra; ++i)
++            loops->append(RunLoop::create("Audio Decoder (PS4)"_s, ThreadType::Audio));
++    });
++    static std::atomic<unsigned> next { 0 };
++    const unsigned turn = next++ % (extra + 1);
++    return turn == extra ? own : (*loops)[turn].get();
++}
++#endif
++
+ Ref<DecodingTaskPromise> AsyncAudioDecoder::decodeAsync(Ref<ArrayBuffer>&& audioData, float sampleRate)
+ {
++#if defined(__ORBIS__)
++    return WTF::invokeAsync(wispDecoderRunLoop(m_runLoop.get()), [audioData = WTF::move(audioData), sampleRate] () mutable {
++#else
+     return WTF::invokeAsync(m_runLoop, [audioData = WTF::move(audioData), sampleRate] () mutable {
++#endif
+         auto audioBuffer = AudioBuffer::createFromAudioFileData(audioData->span(), false, sampleRate);
+         // The ArrayBuffer must be deleted on the main thread, send it back there to be derefed.
+         callOnMainThread([audioData = WTF::move(audioData)] { });
+diff --git a/Source/WebCore/platform/audio/gstreamer/AudioFileReaderGStreamer.cpp b/Source/WebCore/platform/audio/gstreamer/AudioFileReaderGStreamer.cpp
+index e7a456e8..d7c1912c 100644
+--- a/Source/WebCore/platform/audio/gstreamer/AudioFileReaderGStreamer.cpp
++++ b/Source/WebCore/platform/audio/gstreamer/AudioFileReaderGStreamer.cpp
+@@ -38,6 +38,12 @@
+ #include <wtf/WeakPtr.h>
+ #include <wtf/glib/GUniquePtr.h>
+ #include <wtf/text/MakeString.h>
++#if defined(__ORBIS__)
++#include <cmath>
++#include <cstring>
++#include <wtf/Lock.h>
++#include <wtf/MonotonicTime.h>
++#endif
+ 
+ namespace WebCore {
+ class AudioFileReader;
+@@ -465,8 +471,128 @@ RefPtr<AudioBus> AudioFileReader::createBus(float sampleRate, bool mixToMono)
+     return audioBus;
+ }
+ 
++#if defined(__ORBIS__)
++// PS4 (Wisp): WAV files (RIFF/WAVE: integer PCM of 8, 16, 24 or 32 bits, float of 32 or 64, and
++// WAVE_FORMAT_EXTENSIBLE of those) read here, without a GStreamer pipeline: each GStreamer decode is a
++// thread of its own and a pipeline with its own threads, one file after another, and a game decoding a
++// few hundred short sounds waited for them (v00.42: Crash Bash online's sound effects and music samples
++// are WAV; its sound was missing for ~100 s while a level's ones were decoded). Anything else, or a WAV
++// this does not read, goes to GStreamer as before.
++static RefPtr<AudioBus> wispBusFromWav(std::span<const uint8_t> data, bool mixToMono, float sampleRate)
++{
++    const auto u16 = [&](size_t at) { return static_cast<uint32_t>(data[at]) | static_cast<uint32_t>(data[at + 1]) << 8; };
++    const auto u32 = [&](size_t at) { return u16(at) | u16(at + 2) << 16; };
++    if (data.size() < 12 || memcmp(data.data(), "RIFF", 4) || memcmp(data.data() + 8, "WAVE", 4))
++        return nullptr;
++    unsigned format = 0, channels = 0, rate = 0, bits = 0, blockAlign = 0;
++    bool haveFormat = false;
++    std::span<const uint8_t> samples;
++    bool haveSamples = false;
++    size_t at = 12;
++    while (at + 8 <= data.size() && !(haveFormat && haveSamples)) {
++        const size_t size = u32(at + 4);
++        const size_t body = at + 8;
++        const size_t available = data.size() - body;
++        if (!memcmp(data.data() + at, "fmt ", 4)) {
++            if (size < 16 || available < 16)
++                return nullptr;
++            format = u16(body);
++            channels = u16(body + 2);
++            rate = u32(body + 4);
++            blockAlign = u16(body + 12);
++            bits = u16(body + 14);
++            if (format == 0xFFFE) {   // WAVE_FORMAT_EXTENSIBLE: the subformat GUID starts with the format
++                if (size < 40 || available < 40)
++                    return nullptr;
++                format = u16(body + 24);
++            }
++            haveFormat = true;
++        } else if (!memcmp(data.data() + at, "data", 4)) {
++            // (a size past the file's end, or a streaming writer's 0xFFFFFFFF: what is there, as players do)
++            samples = data.subspan(body, std::min(size, available));
++            haveSamples = true;
++        }
++        if (size > available)
++            break;
++        at = body + size + (size & 1);
++    }
++    const bool integer = format == 1 && (bits == 8 || bits == 16 || bits == 24 || bits == 32);
++    const bool floating = format == 3 && (bits == 32 || bits == 64);
++    if (!haveFormat || !haveSamples || !(integer || floating) || !channels || channels > 32
++        || rate < 1000 || rate > 384000 || blockAlign != channels * (bits / 8))
++        return nullptr;
++    const size_t frames = samples.size() / blockAlign;
++    if (!frames || (mixToMono && channels > 2))
++        return nullptr;
++    auto bus = AudioBus::create(channels, frames, true);
++    bus->setSampleRate(rate);
++    const unsigned bytes = bits / 8;
++    for (unsigned channel = 0; channel < channels; ++channel) {
++        auto out = bus->channel(channel)->mutableSpan();
++        const uint8_t* in = samples.data() + channel * bytes;
++        for (size_t frame = 0; frame < frames; ++frame, in += blockAlign) {
++            float value = 0;
++            if (floating && bits == 32) {
++                uint32_t word = static_cast<uint32_t>(in[0]) | static_cast<uint32_t>(in[1]) << 8 | static_cast<uint32_t>(in[2]) << 16 | static_cast<uint32_t>(in[3]) << 24;
++                memcpy(&value, &word, sizeof value);
++            } else if (floating) {
++                uint64_t word = 0;
++                for (unsigned i = 0; i < 8; ++i)
++                    word |= static_cast<uint64_t>(in[i]) << (8 * i);
++                double wide;
++                memcpy(&wide, &word, sizeof wide);
++                value = static_cast<float>(wide);
++            } else if (bits == 8)
++                value = (static_cast<int>(in[0]) - 128) / 128.f;
++            else if (bits == 16)
++                value = static_cast<int16_t>(in[0] | in[1] << 8) / 32768.f;
++            else if (bits == 24)
++                value = static_cast<int32_t>(static_cast<uint32_t>(in[0]) << 8 | static_cast<uint32_t>(in[1]) << 16 | static_cast<uint32_t>(in[2]) << 24) / 2147483648.f;
++            else
++                value = static_cast<int32_t>(static_cast<uint32_t>(in[0]) | static_cast<uint32_t>(in[1]) << 8 | static_cast<uint32_t>(in[2]) << 16 | static_cast<uint32_t>(in[3]) << 24) / 2147483648.f;
++            out[frame] = std::isfinite(value) ? value : 0.f;
++        }
++    }
++    // (decodeAudioData's buffers are at the context's rate: the GStreamer reader resamples to it too)
++    if (static_cast<float>(rate) != sampleRate)
++        return AudioBus::createBySampleRateConverting(bus.get(), mixToMono, sampleRate);
++    if (mixToMono && channels == 2)
++        return AudioBus::createByMixingToMono(bus.get());
++    return bus;
++}
++
++// web.log: the first decodes one by one, then every 32nd with the totals (settings: audio_log=0 leaves them out)
++static void wispNoteDecode(bool wav, size_t bytes, bool decoded, Seconds took)
++{
++    static const bool wanted = [] {
++        const char* value = getenv("WISP_AUDIO_LOG");
++        return !value || strcmp(value, "0");
++    }();
++    if (!wanted)
++        return;
++    static Lock lock;
++    static unsigned count, wavCount, failed;
++    static double total;
++    Locker locker { lock };
++    ++count;
++    wavCount += wav;
++    failed += !decoded;
++    total += took.seconds();
++    if (count <= 6 || !(count % 32))
++        WTFLogAlways("Web Audio (PS4): decodeAudioData #%u: %zu KiB %s in %.0f ms%s (%u decoded, %u of them WAV here, %u failed; %.1f s in all)",
++            count, bytes >> 10, wav ? "WAV, read here" : "by GStreamer", took.milliseconds(), decoded ? "" : ", FAILED", count, wavCount, failed, total);
++}
++#endif
++
+ RefPtr<AudioBus> createBusFromInMemoryAudioFile(std::span<const uint8_t> data, bool mixToMono, float sampleRate)
+ {
++#if defined(__ORBIS__)
++    const MonotonicTime started = MonotonicTime::now();
++    if (RefPtr wav = wispBusFromWav(data, mixToMono, sampleRate)) {
++        wispNoteDecode(true, data.size(), true, MonotonicTime::now() - started);
++        return wav;
++    }
++#endif
+     ensureGStreamerInitialized();
+     static std::once_flag onceFlag;
+     std::call_once(onceFlag, [] {
+@@ -479,6 +605,9 @@ RefPtr<AudioBus> createBusFromInMemoryAudioFile(std::span<const uint8_t> data, b
+         bus = AudioFileReader(data).createBus(sampleRate, mixToMono);
+     });
+     thread->waitForCompletion();
++#if defined(__ORBIS__)
++    wispNoteDecode(false, data.size(), !!bus, MonotonicTime::now() - started);
++#endif
+     return bus;
+ }
+ 
+-- 
+2.53.0
+

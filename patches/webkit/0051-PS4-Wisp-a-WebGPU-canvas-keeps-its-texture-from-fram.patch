@@ -1,0 +1,286 @@
+From 2ad575db72cb192ad3335c4aa625888581b68d81 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Thu, 26 Nov 2026 16:40:26 +0300
+Subject: [PATCH] PS4 (Wisp): a WebGPU canvas keeps its texture from frame to
+ frame
+
+getCurrentTexture() made a new Dawn texture every frame and present() let it
+go: a GPU allocation every frame (direct memory, its mapping, Dawn's lazy
+clear), freed only once the GPU was done with it. Mortal Kombat (v00.43) ran
+the PS4's direct memory dry about 90 s in, and its canvas went black with
+"CreateTexture: vkAllocateMemory failed".
+
+The presentation context now keeps one texture for a canvas until its size or
+configuration changes or the page destroys it (TextureImpl::wasDestroyed):
+present() copies it into the readback buffer and then clears it with a render
+pass in the same submission, so the next frame starts from transparent black
+as a new texture would (the canvas's usage gains RenderAttachment for that).
+A frame presented while two readbacks are in flight is still cleared, just
+not read back. A texture whose creation ran short of memory (an error scope
+around it) is not kept, so the next frame tries again instead of drawing into
+an error texture for good.
+
+Counted for the web process's log: frames presented, not read back, shown,
+and textures made (wisp_frame_counters 4-7).
+---
+ .../WebGPUPresentationContextImpl.cpp         | 108 +++++++++++++++---
+ .../WebGPUPresentationContextImpl.h           |   9 +-
+ .../Implementation/WebGPUTextureImpl.cpp      |   1 +
+ .../WebGPU/Implementation/WebGPUTextureImpl.h |   4 +
+ 4 files changed, 103 insertions(+), 19 deletions(-)
+
+diff --git a/Source/WebCore/Modules/WebGPU/Implementation/WebGPUPresentationContextImpl.cpp b/Source/WebCore/Modules/WebGPU/Implementation/WebGPUPresentationContextImpl.cpp
+index 12aa52e5..fc0c5b68 100644
+--- a/Source/WebCore/Modules/WebGPU/Implementation/WebGPUPresentationContextImpl.cpp
++++ b/Source/WebCore/Modules/WebGPU/Implementation/WebGPUPresentationContextImpl.cpp
+@@ -38,10 +38,17 @@
+ #include <wtf/TZoneMallocInlines.h>
+ #include <wtf/WeakPtr.h>
+ 
++extern "C" unsigned long long wisp_frame_counters[8];
++
+ namespace WebCore::WebGPU {
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(PresentationContextImpl);
+ 
++static void countFrame(unsigned slot)
++{
++    __atomic_fetch_add(&wisp_frame_counters[slot], 1ull, __ATOMIC_RELAXED);
++}
++
+ PresentationContextImpl::PresentationContextImpl(ConvertToBackingContext& convertToBackingContext)
+     : m_convertToBackingContext(convertToBackingContext)
+ {
+@@ -57,6 +64,7 @@ void PresentationContextImpl::setSize(uint32_t width, uint32_t height)
+     m_height = height;
+     // the next getCurrentTexture() makes one of the new size
+     m_currentTexture = nullptr;
++    m_keptTexture = nullptr;
+ }
+ 
+ bool PresentationContextImpl::configure(const CanvasConfiguration& configuration)
+@@ -65,13 +73,15 @@ bool PresentationContextImpl::configure(const CanvasConfiguration& configuration
+     m_device = convertToBackingContext->convertToBacking(configuration.device.get());
+     m_format = configuration.format;
+     m_backingFormat = convertToBackingContext->convertToBacking(configuration.format);
+-    // read back by a copy: CopySrc besides what the page asked for
+-    m_usage = convertToBackingContext->convertTextureUsageFlagsToBacking(configuration.usage) | WGPUTextureUsage_CopySrc;
++    // read back by a copy, and cleared by a render pass for the next frame: CopySrc and RenderAttachment besides
++    // what the page asked for (every canvas format can be both)
++    m_usage = convertToBackingContext->convertTextureUsageFlagsToBacking(configuration.usage) | WGPUTextureUsage_CopySrc | WGPUTextureUsage_RenderAttachment;
+     m_viewFormats = configuration.viewFormats.map([&](auto format) {
+         return convertToBackingContext->convertToBacking(format);
+     });
+     m_alphaMode = configuration.compositingAlphaMode;
+     m_currentTexture = nullptr;
++    m_keptTexture = nullptr;
+     m_freeReadbackBuffers.clear();
+     switch (m_backingFormat) {
+     case WGPUTextureFormat_BGRA8Unorm:
+@@ -87,6 +97,7 @@ void PresentationContextImpl::unconfigure()
+ {
+     m_device = nullptr;
+     m_currentTexture = nullptr;
++    m_keptTexture = nullptr;
+     m_freeReadbackBuffers.clear();
+ }
+ 
+@@ -97,6 +108,15 @@ RefPtr<Texture> PresentationContextImpl::getCurrentTexture(uint32_t)
+     if (m_currentTexture)
+         return m_currentTexture;
+ 
++    // (v00.44) The texture is kept from frame to frame and cleared after each present, as a new one would be:
++    // a new Dawn texture each frame was a new GPU allocation (direct memory, its mapping, Dawn's lazy clear)
++    // each frame, and with Dawn's deferred frees it ran direct memory dry (Mortal Kombat, v00.43, ~90 s in).
++    if (m_keptTexture && !m_keptTexture->wasDestroyed()) {
++        m_currentTexture = m_keptTexture;
++        return m_currentTexture;
++    }
++    m_keptTexture = nullptr;
++
+     WGPUTextureDescriptor descriptor = WGPU_TEXTURE_DESCRIPTOR_INIT;
+     static constexpr char label[] = "canvas";
+     descriptor.label = WGPUStringView { label, sizeof(label) - 1 };
+@@ -106,7 +126,33 @@ RefPtr<Texture> PresentationContextImpl::getCurrentTexture(uint32_t)
+     descriptor.format = m_backingFormat;
+     descriptor.viewFormatCount = m_viewFormats.size();
+     descriptor.viewFormats = m_viewFormats.size() ? m_viewFormats.span().data() : nullptr;
+-    m_currentTexture = TextureImpl::create(adoptWebGPU(wgpuDeviceCreateTexture(m_device.get(), &descriptor)), m_format, TextureDimension::_2d, m_convertToBackingContext);
++    // Short of memory, Dawn gives an error texture: kept, it would leave the canvas black for good, so the
++    // creation's error scope lets it go when it failed (the next frame makes another).
++    wgpuDevicePushErrorScope(m_device.get(), WGPUErrorFilter_OutOfMemory);
++    RefPtr texture = TextureImpl::create(adoptWebGPU(wgpuDeviceCreateTexture(m_device.get(), &descriptor)), m_format, TextureDimension::_2d, m_convertToBackingContext);
++    using Handler = Function<void(bool)>;
++    Handler handler = [weakThis = WeakPtr { *this }, texture](bool failed) {
++        RefPtr protectedThis = weakThis.get();
++        if (!failed || !protectedThis)
++            return;
++        if (protectedThis->m_keptTexture == texture)
++            protectedThis->m_keptTexture = nullptr;
++        static unsigned notes = 0;
++        if (notes++ < 8)
++            WTFLogAlways("WebGPU (PS4): a canvas texture got no GPU memory; the next frame makes another");
++    };
++    WGPUPopErrorScopeCallbackInfo callbackInfo = WGPU_POP_ERROR_SCOPE_CALLBACK_INFO_INIT;
++    callbackInfo.mode = WGPUCallbackMode_AllowProcessEvents;
++    callbackInfo.callback = [](WGPUPopErrorScopeStatus status, WGPUErrorType type, WGPUStringView, void* userdata1, void*) {
++        auto pending = takePendingCallback<Handler>(userdata1);
++        pending->handler()(status == WGPUPopErrorScopeStatus_Success && type != WGPUErrorType_NoError);
++    };
++    callbackInfo.userdata1 = pendingCallback(m_convertToBackingContext->eventPump(), WTF::move(handler));
++    wgpuDevicePopErrorScope(m_device.get(), callbackInfo);
++    countFrame(7);
++
++    m_keptTexture = texture;
++    m_currentTexture = WTF::move(texture);
+     return m_currentTexture;
+ }
+ 
+@@ -130,31 +176,59 @@ void PresentationContextImpl::present(uint32_t, bool)
+     RefPtr texture = std::exchange(m_currentTexture, nullptr);
+     if (!texture || !m_device)
+         return;
+-    if (m_readsInFlight >= 2)
+-        return; // the GPU is two frames behind: this one is dropped
++    countFrame(4);
++    // the GPU two frames behind: this one is not read back (the kept texture is still cleared)
++    const bool drop = m_readsInFlight >= 2;
++    const bool keep = texture == m_keptTexture && !texture->wasDestroyed();
++    if (drop)
++        countFrame(5);
++    if (drop && !keep)
++        return;
+ 
+     const uint32_t bytesPerPixel = m_backingFormat == WGPUTextureFormat_RGBA16Float ? 8 : 4;
+     const uint32_t width = m_width;
+     const uint32_t height = m_height;
+     const uint32_t bytesPerRow = (width * bytesPerPixel + 255) & ~255u;
+     const uint64_t size = static_cast<uint64_t>(bytesPerRow) * height;
+-    auto buffer = takeReadbackBuffer(size);
+-    if (!buffer)
++    WebGPUPtr<WGPUBuffer> buffer;
++    if (!drop)
++        buffer = takeReadbackBuffer(size);
++    if (!buffer && !keep)
+         return;
+ 
+     auto encoder = adoptWebGPU(wgpuDeviceCreateCommandEncoder(m_device.get(), nullptr));
+-    WGPUTexelCopyTextureInfo source = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+-    source.texture = m_convertToBackingContext->convertToBacking(*texture);
+-    WGPUTexelCopyBufferInfo destination = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+-    destination.layout.bytesPerRow = bytesPerRow;
+-    destination.layout.rowsPerImage = height;
+-    destination.buffer = buffer.get();
+-    WGPUExtent3D extent { width, height, 1 };
+-    wgpuCommandEncoderCopyTextureToBuffer(encoder.get(), &source, &destination, &extent);
++    WGPUTexture backingTexture = m_convertToBackingContext->convertToBacking(*texture);
++    if (buffer) {
++        WGPUTexelCopyTextureInfo source = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
++        source.texture = backingTexture;
++        WGPUTexelCopyBufferInfo destination = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
++        destination.layout.bytesPerRow = bytesPerRow;
++        destination.layout.rowsPerImage = height;
++        destination.buffer = buffer.get();
++        WGPUExtent3D extent { width, height, 1 };
++        wgpuCommandEncoderCopyTextureToBuffer(encoder.get(), &source, &destination, &extent);
++    }
++    if (keep) {
++        // the next frame starts from transparent black, as a new texture would (after the copy, in the same
++        // submission: the GPU runs them in order)
++        auto view = adoptWebGPU(wgpuTextureCreateView(backingTexture, nullptr));
++        WGPURenderPassColorAttachment attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
++        attachment.view = view.get();
++        attachment.loadOp = WGPULoadOp_Clear;
++        attachment.storeOp = WGPUStoreOp_Store;
++        attachment.clearValue = WGPUColor { 0, 0, 0, 0 };
++        WGPURenderPassDescriptor passDescriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
++        passDescriptor.colorAttachmentCount = 1;
++        passDescriptor.colorAttachments = &attachment;
++        auto pass = adoptWebGPU(wgpuCommandEncoderBeginRenderPass(encoder.get(), &passDescriptor));
++        wgpuRenderPassEncoderEnd(pass.get());
++    }
+     auto commandBuffer = adoptWebGPU(wgpuCommandEncoderFinish(encoder.get(), nullptr));
+     WGPUCommandBuffer submitted = commandBuffer.get();
+     auto queue = adoptWebGPU(wgpuDeviceGetQueue(m_device.get()));
+     wgpuQueueSubmit(queue.get(), 1, &submitted);
++    if (!buffer)
++        return;
+ 
+     m_readsInFlight++;
+     using Handler = Function<void(WGPUMapAsyncStatus)>;
+@@ -188,8 +262,10 @@ void PresentationContextImpl::frameReadBack(WebGPUPtr<WGPUBuffer>&& buffer, uint
+         SkColorType colorType = m_backingFormat == WGPUTextureFormat_RGBA16Float ? kRGBA_F16_SkColorType : m_backingFormat == WGPUTextureFormat_RGBA8Unorm ? kRGBA_8888_SkColorType : kBGRA_8888_SkColorType;
+         SkAlphaType alphaType = m_alphaMode == CanvasAlphaMode::Opaque ? kOpaque_SkAlphaType : kPremul_SkAlphaType;
+         SkPixmap pixmap(SkImageInfo::Make(width, height, colorType, alphaType), pixels, bytesPerRow);
+-        if (auto image = SkImages::RasterFromPixmapCopy(pixmap))
++        if (auto image = SkImages::RasterFromPixmapCopy(pixmap)) {
+             m_displayImage = NativeImage::create(WTF::move(image));
++            countFrame(6);
++        }
+     }
+     wgpuBufferUnmap(buffer.get());
+     if (width == m_width && height == m_height && m_device)
+diff --git a/Source/WebCore/Modules/WebGPU/Implementation/WebGPUPresentationContextImpl.h b/Source/WebCore/Modules/WebGPU/Implementation/WebGPUPresentationContextImpl.h
+index 6b79e959..f85a3e85 100644
+--- a/Source/WebCore/Modules/WebGPU/Implementation/WebGPUPresentationContextImpl.h
++++ b/Source/WebCore/Modules/WebGPU/Implementation/WebGPUPresentationContextImpl.h
+@@ -44,9 +44,10 @@ class ConvertToBackingContext;
+ class TextureImpl;
+ 
+ // PS4 (Wisp): a WebGPU canvas's buffers without a surface. getCurrentTexture() is a Dawn texture of the canvas's
+-// size; present() copies it into a mappable buffer and, once Dawn has mapped it (a frame or two later), keeps the
+-// pixels as a Skia image: what the canvas paints (CompositorIntegrationImpl). At most two frames are read back at
+-// once; a frame presented while the GPU is further behind is dropped.
++// size, kept from frame to frame (v00.44); present() copies it into a mappable buffer and clears it for the next
++// frame and, once Dawn has mapped the copy (a frame or two later), keeps the pixels as a Skia image: what the
++// canvas paints (CompositorIntegrationImpl). At most two frames are read back at once; a frame presented while
++// the GPU is further behind is not read back.
+ class PresentationContextImpl final : public PresentationContext {
+     WTF_MAKE_TZONE_ALLOCATED(PresentationContextImpl);
+ public:
+@@ -99,6 +100,8 @@ private:
+     WebGPUPtr<WGPUDevice> m_device;
+     const Ref<ConvertToBackingContext> m_convertToBackingContext;
+     RefPtr<TextureImpl> m_currentTexture;
++    // the texture every frame draws into, until the size or the configuration changes or the page destroys it
++    RefPtr<TextureImpl> m_keptTexture;
+     RefPtr<WebCore::NativeImage> m_displayImage;
+     Vector<std::pair<WebGPUPtr<WGPUBuffer>, uint64_t>> m_freeReadbackBuffers;
+     unsigned m_readsInFlight { 0 };
+diff --git a/Source/WebCore/Modules/WebGPU/Implementation/WebGPUTextureImpl.cpp b/Source/WebCore/Modules/WebGPU/Implementation/WebGPUTextureImpl.cpp
+index 8307e62d..f5fb973e 100644
+--- a/Source/WebCore/Modules/WebGPU/Implementation/WebGPUTextureImpl.cpp
++++ b/Source/WebCore/Modules/WebGPU/Implementation/WebGPUTextureImpl.cpp
+@@ -69,6 +69,7 @@ RefPtr<TextureView> TextureImpl::createView(const std::optional<TextureViewDescr
+ 
+ void TextureImpl::destroy()
+ {
++    m_destroyed = true;
+     wgpuTextureDestroy(m_backing.get());
+ }
+ 
+diff --git a/Source/WebCore/Modules/WebGPU/Implementation/WebGPUTextureImpl.h b/Source/WebCore/Modules/WebGPU/Implementation/WebGPUTextureImpl.h
+index 8aff1c10..34341af2 100644
+--- a/Source/WebCore/Modules/WebGPU/Implementation/WebGPUTextureImpl.h
++++ b/Source/WebCore/Modules/WebGPU/Implementation/WebGPUTextureImpl.h
+@@ -49,6 +49,9 @@ public:
+ 
+     virtual ~TextureImpl();
+ 
++    // the page destroyed it (a canvas's kept texture is not used again then: PresentationContextImpl)
++    bool wasDestroyed() const { return m_destroyed; }
++
+ private:
+     friend class DowncastConvertToBackingContext;
+ 
+@@ -71,6 +74,7 @@ private:
+ 
+     WebGPUPtr<WGPUTexture> m_backing;
+     const Ref<ConvertToBackingContext> m_convertToBackingContext;
++    bool m_destroyed { false };
+ };
+ 
+ } // namespace WebCore::WebGPU
+-- 
+2.53.0
+

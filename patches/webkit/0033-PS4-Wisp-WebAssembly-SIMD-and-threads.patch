@@ -1,0 +1,330 @@
+From ad72025d750c8696d3b357b4fd52a967801c5155 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Tue, 24 Nov 2026 23:12:29 +0300
+Subject: [PATCH] PS4 (Wisp): WebAssembly SIMD and threads
+
+JavaScriptCore keeps WebAssembly SIMD only on a CPU with AVX, and on the PS4 its check left SIMD off:
+pages found none (Ruffle fell back to its plain module). The Jaguar has AVX and the whole program is
+built for it (-march=btver2), so AVX is taken as present on the PS4; what CPUID said goes to the log
+once.
+
+Shared WebAssembly memories (WebAssembly threads) needed the fault signal handler, which the PS4 build
+leaves off (the app's crash log owns SIGSEGV and SIGBUS): a module with one did not parse ("shared
+memory is not enabled") and new WebAssembly.Memory({shared: true}) made a memory that was not shared.
+With SharedArrayBuffer on (JSC_useSharedArrayBuffer, the app's setting) both work on the PS4,
+bounds-checked. JavaScriptCore checks such a memory against its maximum, so an access between its size
+and its maximum faults instead of trapping: only a module that reads past the end of its own memory
+does that.
+
+A growable bounds-checking memory (a shared memory, a resizable or growable ArrayBuffer) was its whole
+maximum in memory from the start, the pages past its size protected: the PS4 puts memory behind every
+mapping at once, and a game's shared memory has a maximum of 4 GiB. Now it is a reservation (address
+space only: WTF's OSAllocator), whose pages get memory as the buffer grows (wtf_ps4_commit; no memory
+left is an out-of-memory error, not a stop) and give it back as a resizable buffer shrinks.
+---
+ .../assembler/MacroAssemblerX86_64.cpp        | 11 +++++++
+ Source/JavaScriptCore/runtime/ArrayBuffer.cpp | 33 +++++++++++++++++++
+ .../runtime/BufferMemoryHandle.cpp            | 15 +++++++++
+ Source/JavaScriptCore/wasm/WasmMemory.cpp     | 17 ++++++++++
+ .../JavaScriptCore/wasm/WasmSectionParser.cpp |  5 +++
+ .../wasm/js/WebAssemblyMemoryConstructor.cpp  |  5 +++
+ Source/WTF/wtf/ps4/OSAllocatorPS4.cpp         | 33 ++++++++++++++-----
+ 7 files changed, 111 insertions(+), 8 deletions(-)
+
+diff --git a/Source/JavaScriptCore/assembler/MacroAssemblerX86_64.cpp b/Source/JavaScriptCore/assembler/MacroAssemblerX86_64.cpp
+index 8f66ef86..88399792 100644
+--- a/Source/JavaScriptCore/assembler/MacroAssemblerX86_64.cpp
++++ b/Source/JavaScriptCore/assembler/MacroAssemblerX86_64.cpp
+@@ -35,6 +35,9 @@
+ #if OS(DARWIN)
+ #include <sys/sysctl.h>
+ #endif
++#if defined(__ORBIS__)
++#include <stdio.h>
++#endif
+ 
+ namespace JSC {
+ 
+@@ -509,6 +512,14 @@ void MacroAssemblerX86_64::collectCPUFeatures()
+             s_popcntCheckState = (cpuid[2] & (1 << 23)) ? CPUIDCheckState::Set : CPUIDCheckState::Clear;
+ #if OS(DARWIN)
+             s_avxCheckState = CPUIDCheckState::Set;
++#elif defined(__ORBIS__)
++            // PS4 (Wisp): the Jaguar has AVX and the whole program is built for it (-march=btver2), so
++            // it works whatever CPUID says; JavaScriptCore keeps WebAssembly SIMD only with AVX. What
++            // CPUID said goes to the log once (leaf 1, ECX: bit 28 AVX, bit 27 OSXSAVE).
++            s_avxCheckState = CPUIDCheckState::Set;
++            fprintf(stderr, "JavaScriptCore (PS4): CPUID 1 ECX 0x%08x (AVX %u, OSXSAVE %u, SSE4.1 %u, SSE4.2 %u): AVX taken as present\n",
++                static_cast<unsigned>(cpuid[2]), static_cast<unsigned>((cpuid[2] >> 28) & 1), static_cast<unsigned>((cpuid[2] >> 27) & 1),
++                static_cast<unsigned>((cpuid[2] >> 19) & 1), static_cast<unsigned>((cpuid[2] >> 20) & 1));
+ #else
+             s_avxCheckState = (cpuid[2] & (1 << 28)) ? CPUIDCheckState::Set : CPUIDCheckState::Clear;
+ #endif
+diff --git a/Source/JavaScriptCore/runtime/ArrayBuffer.cpp b/Source/JavaScriptCore/runtime/ArrayBuffer.cpp
+index 19d38026..15af87a3 100644
+--- a/Source/JavaScriptCore/runtime/ArrayBuffer.cpp
++++ b/Source/JavaScriptCore/runtime/ArrayBuffer.cpp
+@@ -43,6 +43,11 @@
+ 
+ WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
+ 
++#if defined(__ORBIS__)
++// PS4 (Wisp): memory into part of a reservation (WTF's ps4/OSAllocatorPS4.cpp); false when none is left
++extern "C" bool wtf_ps4_commit(void* address, size_t bytes);
++#endif
++
+ namespace JSC {
+ namespace ArrayBufferInternal {
+ static constexpr bool verbose = false;
+@@ -134,9 +139,18 @@ static RefPtr<BufferMemoryHandle> tryAllocateResizableMemory(VM* vm, size_t size
+         return nullptr;
+     }
+ 
++#if defined(__ORBIS__)
++    // PS4 (Wisp): the reservation is address space only; the first pages get memory now, the rest as it grows
++    if (!wtf_ps4_commit(slowMemory, initialBytes)) {
++        BufferMemoryManager::singleton().freeGrowableBoundsCheckingMemory(slowMemory, maximumBytes);
++        BufferMemoryManager::singleton().freePhysicalBytes(initialBytes);
++        return nullptr;
++    }
++#else
+     constexpr bool readable = false;
+     constexpr bool writable = false;
+     OSAllocator::protect(slowMemory + initialBytes, maximumBytes - initialBytes, readable, writable);
++#endif
+     return adoptRef(*new BufferMemoryHandle(slowMemory, initialBytes, maximumBytes, PageCount::fromBytes(initialBytes), PageCount::fromBytes(maximumBytes), MemorySharingMode::Shared, MemoryMode::BoundsChecking));
+ }
+ 
+@@ -590,9 +604,16 @@ Expected<int64_t, GrowFailReason> ArrayBuffer::resize(VM& vm, size_t newByteLeng
+                 uint8_t* startAddress = static_cast<uint8_t*>(memory) + memoryHandle->size();
+ 
+                 dataLogLnIf(ArrayBufferInternal::verbose, "Marking memory's ", RawPointer(memory), " as read+write in range [", RawPointer(startAddress), ", ", RawPointer(startAddress + bytesToAdd), ")");
++#if defined(__ORBIS__)
++                if (!wtf_ps4_commit(startAddress, bytesToAdd)) {
++                    BufferMemoryManager::singleton().freePhysicalBytes(bytesToAdd);
++                    return makeUnexpected(GrowFailReason::OutOfMemory);
++                }
++#else
+                 constexpr bool readable = true;
+                 constexpr bool writable = true;
+                 OSAllocator::protect(startAddress, bytesToAdd, readable, writable);
++#endif
+             } else {
+                 size_t bytesToSubtract = memoryHandle->size() - desiredSize;
+                 ASSERT(bytesToSubtract);
+@@ -606,9 +627,14 @@ Expected<int64_t, GrowFailReason> ArrayBuffer::resize(VM& vm, size_t newByteLeng
+                 uint8_t* startAddress = static_cast<uint8_t*>(memory) + desiredSize;
+ 
+                 dataLogLnIf(ArrayBufferInternal::verbose, "Marking memory's ", RawPointer(memory), " as none in range [", RawPointer(startAddress), ", ", RawPointer(startAddress + bytesToSubtract), ")");
++#if defined(__ORBIS__)
++                // (PS4: the pages' memory goes back; the range is address space only again)
++                OSAllocator::decommit(startAddress, bytesToSubtract);
++#else
+                 constexpr bool readable = false;
+                 constexpr bool writable = false;
+                 OSAllocator::protect(startAddress, bytesToSubtract, readable, writable);
++#endif
+             }
+             memoryHandle->updateSize(desiredSize);
+         }
+@@ -699,9 +725,16 @@ Expected<int64_t, GrowFailReason> SharedArrayBufferContents::grow(const Abstract
+         uint8_t* startAddress = static_cast<uint8_t*>(memory) + memoryHandle->size();
+ 
+         dataLogLnIf(ArrayBufferInternal::verbose, "Marking memory's ", RawPointer(memory), " as read+write in range [", RawPointer(startAddress), ", ", RawPointer(startAddress + extraBytes), ")");
++#if defined(__ORBIS__)
++        if (!wtf_ps4_commit(startAddress, extraBytes)) {
++            BufferMemoryManager::singleton().freePhysicalBytes(extraBytes);
++            return makeUnexpected(GrowFailReason::OutOfMemory);
++        }
++#else
+         constexpr bool readable = true;
+         constexpr bool writable = true;
+         OSAllocator::protect(startAddress, extraBytes, readable, writable);
++#endif
+         memoryHandle->updateSize(desiredSize);
+     }
+ 
+diff --git a/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp b/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
+index d94ceb59..d060e6b9 100644
+--- a/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
++++ b/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
+@@ -112,7 +112,14 @@ BufferMemoryResult BufferMemoryManager::tryAllocateGrowableBoundsCheckingMemory(
+ {
+     BufferMemoryResult result = [&] {
+         Locker locker { m_lock };
++#if defined(__ORBIS__)
++        // PS4 (Wisp): address space only. The PS4 puts memory behind every mapping at once, so the whole
++        // maximum (4 GiB for a game's shared memory) would be memory from the start; the pages in use get
++        // it as the buffer grows (wtf_ps4_commit: ArrayBuffer.cpp, wasm/WasmMemory.cpp).
++        void* result = OSAllocator::tryReserveUncommitted(std::max<size_t>(mappedCapacity, 64 * KB));
++#else
+         void* result = Gigacage::tryAllocateZeroedVirtualPages(Gigacage::Primitive, mappedCapacity);
++#endif
+         if (!result)
+             return BufferMemoryResult(nullptr, BufferMemoryResult::Kind::SyncTryToReclaimMemory);
+ 
+@@ -130,7 +137,12 @@ void BufferMemoryManager::freeGrowableBoundsCheckingMemory(void* basePtr, size_t
+ {
+     {
+         Locker locker { m_lock };
++#if defined(__ORBIS__)
++        // (the memory in it goes back too: WTF's ps4/OSAllocatorPS4.cpp)
++        OSAllocator::releaseDecommitted(basePtr, std::max<size_t>(mappedCapacity, 64 * KB), 0);
++#else
+         Gigacage::freeVirtualPages(Gigacage::Primitive, basePtr, mappedCapacity);
++#endif
+         m_growableBoundsCheckingMemories.erase(std::make_pair(std::bit_cast<uintptr_t>(basePtr), mappedCapacity));
+     }
+ 
+@@ -268,9 +280,12 @@ BufferMemoryHandle::~BufferMemoryHandle()
+                     ASSERT(!m_size);
+                     return;
+                 }
++#if !defined(__ORBIS__)
+                 constexpr bool readable = true;
+                 constexpr bool writable = true;
+                 OSAllocator::protect(memory, m_mappedCapacity, readable, writable);
++#endif
++                // (PS4: nothing protected to undo; the reservation goes whole)
+                 BufferMemoryManager::singleton().freeGrowableBoundsCheckingMemory(memory, m_mappedCapacity);
+                 break;
+             }
+diff --git a/Source/JavaScriptCore/wasm/WasmMemory.cpp b/Source/JavaScriptCore/wasm/WasmMemory.cpp
+index 338a91a1..cf9277df 100644
+--- a/Source/JavaScriptCore/wasm/WasmMemory.cpp
++++ b/Source/JavaScriptCore/wasm/WasmMemory.cpp
+@@ -45,6 +45,11 @@
+ 
+ WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
+ 
++#if defined(__ORBIS__)
++// PS4 (Wisp): memory into part of a reservation (WTF's ps4/OSAllocatorPS4.cpp); false when none is left
++extern "C" bool wtf_ps4_commit(void* address, size_t bytes);
++#endif
++
+ namespace JSC {
+ 
+ namespace Wasm {
+@@ -229,9 +234,21 @@ RefPtr<Memory> Memory::tryCreate(VM& vm, PageCount initial, PageCount maximum, M
+             return nullptr;
+         }
+ 
++#if defined(__ORBIS__)
++        // PS4 (Wisp): the reservation is address space only (BufferMemoryManager); the first pages get memory
++        // now, the rest as the memory grows. JavaScriptCore checks a shared memory against its maximum, and
++        // with no fault handler here an access between its size and its maximum stops the process: only a
++        // module that reads past the end of its own memory does that.
++        if (!wtf_ps4_commit(slowMemory, initialBytes)) {
++            BufferMemoryManager::singleton().freeGrowableBoundsCheckingMemory(slowMemory, maximumBytes);
++            BufferMemoryManager::singleton().freePhysicalBytes(initialBytes);
++            return nullptr;
++        }
++#else
+         constexpr bool readable = false;
+         constexpr bool writable = false;
+         OSAllocator::protect(slowMemory + initialBytes, maximumBytes - initialBytes, readable, writable);
++#endif
+ 
+         auto handle = adoptRef(*new BufferMemoryHandle(slowMemory, initialBytes, maximumBytes, initial, maximum, MemorySharingMode::Shared, MemoryMode::BoundsChecking));
+         auto span = handle->mutableSpan();
+diff --git a/Source/JavaScriptCore/wasm/WasmSectionParser.cpp b/Source/JavaScriptCore/wasm/WasmSectionParser.cpp
+index be23943b..ce837ca1 100644
+--- a/Source/JavaScriptCore/wasm/WasmSectionParser.cpp
++++ b/Source/JavaScriptCore/wasm/WasmSectionParser.cpp
+@@ -284,7 +284,12 @@ auto SectionParser::parseResizableLimits(uint64_t& initial, std::optional<uint64
+ 
+     isShared = flags & isSharedMask;
+     is64bit = flags & is64bitMask;
++#if defined(__ORBIS__)
++    // PS4 (Wisp): no fault handler here; shared memories are bounds-checked, allowed with SharedArrayBuffer
++    WASM_PARSER_FAIL_IF(isShared && !Options::useWasmFaultSignalHandler() && !Options::useSharedArrayBuffer(), "shared memory is not enabled"_s);
++#else
+     WASM_PARSER_FAIL_IF(isShared && !Options::useWasmFaultSignalHandler(), "shared memory is not enabled"_s);
++#endif
+     WASM_PARSER_FAIL_IF(is64bit && !Options::useWasmMemory64(), "Memory64 is not enabled"_s);
+ 
+     if (is64bit)
+diff --git a/Source/JavaScriptCore/wasm/js/WebAssemblyMemoryConstructor.cpp b/Source/JavaScriptCore/wasm/js/WebAssemblyMemoryConstructor.cpp
+index 0e3df364..64a33067 100644
+--- a/Source/JavaScriptCore/wasm/js/WebAssemblyMemoryConstructor.cpp
++++ b/Source/JavaScriptCore/wasm/js/WebAssemblyMemoryConstructor.cpp
+@@ -125,7 +125,12 @@ JSWebAssemblyMemory* WebAssemblyMemoryConstructor::createMemoryFromDescriptor(JS
+     // Even though Options::useSharedArrayBuffer() is false, we can create SharedArrayBuffer through wasm shared memory.
+     // But we cannot send SharedArrayBuffer to the other workers, so it is not effective.
+     MemorySharingMode sharingMode = MemorySharingMode::Default;
++#if defined(__ORBIS__)
++    // PS4 (Wisp): no fault handler here; shared memories are bounds-checked (WasmSectionParser.cpp)
++    if (Options::useWasmFaultSignalHandler() || Options::useSharedArrayBuffer()) [[likely]] {
++#else
+     if (Options::useWasmFaultSignalHandler()) [[likely]] {
++#endif
+         JSValue sharedValue = memoryDescriptor->get(globalObject, Identifier::fromString(vm, "shared"_s));
+         RETURN_IF_EXCEPTION(throwScope, { });
+         bool shared = sharedValue.toBoolean(globalObject);
+diff --git a/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp b/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp
+index 4e478389..2f3aec24 100644
+--- a/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp
++++ b/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp
+@@ -611,18 +611,18 @@ void* OSAllocator::reserveAndCommit(size_t bytes, Usage usage, void* address, bo
+     return result;
+ }
+ 
+-void OSAllocator::commit(void* address, size_t bytes, bool writable, bool)
++namespace {
++
++// Memory over [address, address + bytes): false when there was none left (what got mapped stays)
++bool commitRange(void* address, size_t bytes, int protection, const char* name)
+ {
+     if (!bytes || isExecutable(address))
+-        return;
+-    const int protection = kernelProtRead | (writable ? kernelProtWrite : 0);
++        return true;
+     const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+     const uintptr_t begin = pageDown(start);
+     const uintptr_t end = pageUp(start + bytes);
+-    if (begin == start && end == start + bytes) {
+-        RELEASE_ASSERT(mapMemory(begin, end, protection, "WebKit"));
+-        return;
+-    }
++    if (begin == start && end == start + bytes)
++        return mapMemory(begin, end, protection, name);
+     // Part of a kernel page: memory only where there is none yet (another commit's data stays)
+     uintptr_t run = 0;
+     for (uintptr_t page = begin; page <= end; page += kernelPage) {
+@@ -630,10 +630,19 @@ void OSAllocator::commit(void* address, size_t bytes, bool writable, bool)
+         if (needed && !run)
+             run = page;
+         else if (!needed && run) {
+-            RELEASE_ASSERT(mapMemory(run, page, protection, "WebKit"));
++            if (!mapMemory(run, page, protection, name))
++                return false;
+             run = 0;
+         }
+     }
++    return true;
++}
++
++} // namespace
++
++void OSAllocator::commit(void* address, size_t bytes, bool writable, bool)
++{
++    RELEASE_ASSERT(commitRange(address, bytes, kernelProtRead | (writable ? kernelProtWrite : 0), "WebKit"));
+ }
+ 
+ void OSAllocator::decommit(void* address, size_t bytes)
+@@ -701,4 +710,12 @@ extern "C" size_t wtf_ps4_page_memory(size_t* held)
+     return pagesInUse.load(std::memory_order_relaxed) * kernelPage;
+ }
+ 
++// JavaScriptCore's growable buffers (WebAssembly's shared memories, resizable and growable ArrayBuffers:
++// runtime/BufferMemoryHandle.cpp, ArrayBuffer.cpp, wasm/WasmMemory.cpp) are reservations, address space
++// only; the part in use gets memory here as a buffer grows. False when there is no memory left for it.
++extern "C" bool wtf_ps4_commit(void* address, size_t bytes)
++{
++    return commitRange(address, bytes, kernelProtRead | kernelProtWrite, "WebKit buffers");
++}
++
+ } // namespace WTF
+-- 
+2.53.0
+

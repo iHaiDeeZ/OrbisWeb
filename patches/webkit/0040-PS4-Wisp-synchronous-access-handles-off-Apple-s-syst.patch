@@ -1,0 +1,130 @@
+From 139b8b3dda7ad0b2eb660279e7127344954ea743 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Wed, 25 Nov 2026 21:09:40 +0300
+Subject: [PATCH] PS4 (Wisp): synchronous access handles off Apple's systems
+
+IPC::SharedFileHandle::create() returned nothing off Cocoa, so every
+FileSystemFileHandle.createSyncAccessHandle() failed with NotSupportedError ("Backend
+does not support this operation"): the origin-private file system's synchronous
+access handles, which Emscripten games keep their files with in a worker, never
+opened (Super Mario Sunshine's disc download). With Unix domain sockets the file now
+goes to the web process as a descriptor (a duplicate, as UnixFileDescriptor; decoded
+by adopting it).
+
+FileSystemStorageHandle::createSyncAccessHandle() also took the file's exclusive lock
+before opening the file and making the handle, and kept it when either failed: every
+later removeEntry of that file said NoModificationAllowedError ("The object can not
+be modified"). The lock is released on those failures.
+---
+ .../storage/FileSystemStorageHandle.cpp       | 10 ++++++--
+ .../WebKit/Platform/IPC/SharedFileHandle.cpp  | 25 ++++++++++++++++++-
+ Source/WebKit/Platform/IPC/SharedFileHandle.h |  7 ++++++
+ .../IPC/SharedFileHandle.serialization.in     |  3 +++
+ 4 files changed, 42 insertions(+), 3 deletions(-)
+
+diff --git a/Source/WebKit/NetworkProcess/storage/FileSystemStorageHandle.cpp b/Source/WebKit/NetworkProcess/storage/FileSystemStorageHandle.cpp
+index e0ebe924..40605d01 100644
+--- a/Source/WebKit/NetworkProcess/storage/FileSystemStorageHandle.cpp
++++ b/Source/WebKit/NetworkProcess/storage/FileSystemStorageHandle.cpp
+@@ -221,13 +221,19 @@ Expected<FileSystemSyncAccessHandleInfo, FileSystemStorageError> FileSystemStora
+     if (!acquired)
+         return makeUnexpected(FileSystemStorageError::InvalidState);
+ 
++    // PS4 (Wisp): the lock goes again when the handle cannot be made (it stayed, and every later
++    // removeEntry of the file said NoModificationAllowedError)
+     auto handle = FileSystem::openFile(m_path, FileSystem::FileOpenMode::ReadWrite);
+-    if (!handle)
++    if (!handle) {
++        manager->releaseLockForFile(m_path);
+         return makeUnexpected(FileSystemStorageError::Unknown);
++    }
+ 
+     auto ipcHandle = IPC::SharedFileHandle::create(WTF::move(handle));
+-    if (!ipcHandle)
++    if (!ipcHandle) {
++        manager->releaseLockForFile(m_path);
+         return makeUnexpected(FileSystemStorageError::BackendNotSupported);
++    }
+ 
+     ASSERT(!m_activeSyncAccessHandle);
+     m_activeSyncAccessHandle = SyncAccessHandleInfo { WebCore::FileSystemSyncAccessHandleIdentifier::generate() };
+diff --git a/Source/WebKit/Platform/IPC/SharedFileHandle.cpp b/Source/WebKit/Platform/IPC/SharedFileHandle.cpp
+index 77c5a5fe..8bf272ae 100644
+--- a/Source/WebKit/Platform/IPC/SharedFileHandle.cpp
++++ b/Source/WebKit/Platform/IPC/SharedFileHandle.cpp
+@@ -30,11 +30,34 @@ namespace IPC {
+ 
+ #if !PLATFORM(COCOA)
+ 
+-std::optional<SharedFileHandle> SharedFileHandle::create(FileSystem::FileHandle&&)
++// PS4 (Wisp): with Unix domain sockets the file is sent as a descriptor. Without it every
++// createSyncAccessHandle() failed off Apple's systems ("Backend does not support this operation"):
++// the origin-private file system's synchronous access handles, which Emscripten games keep their
++// files with in a worker, never opened.
++std::optional<SharedFileHandle> SharedFileHandle::create(FileSystem::FileHandle&& handle)
+ {
++#if USE(UNIX_DOMAIN_SOCKETS)
++    if (!handle)
++        return std::nullopt;
++    return SharedFileHandle { WTF::move(handle) };
++#else
++    UNUSED_PARAM(handle);
+     return std::nullopt;
++#endif
++}
++
++#if USE(UNIX_DOMAIN_SOCKETS)
++SharedFileHandle::SharedFileHandle(UnixFileDescriptor&& descriptor)
++    : m_handle(FileSystem::FileHandle::adopt(descriptor.release()))
++{
+ }
+ 
++UnixFileDescriptor SharedFileHandle::toUnixFileDescriptor() const
++{
++    return UnixFileDescriptor { m_handle.platformHandle(), UnixFileDescriptor::Duplicate };
++}
++#endif
++
+ #endif
+ 
+ } // namespace IPC
+diff --git a/Source/WebKit/Platform/IPC/SharedFileHandle.h b/Source/WebKit/Platform/IPC/SharedFileHandle.h
+index bc9a5007..a7ec507b 100644
+--- a/Source/WebKit/Platform/IPC/SharedFileHandle.h
++++ b/Source/WebKit/Platform/IPC/SharedFileHandle.h
+@@ -27,6 +27,9 @@
+ 
+ #include <fcntl.h>
+ #include <wtf/FileHandle.h>
++#if !PLATFORM(COCOA) && USE(UNIX_DOMAIN_SOCKETS)
++#include <wtf/unix/UnixFileDescriptor.h>
++#endif
+ 
+ namespace IPC {
+ 
+@@ -40,6 +43,10 @@ public:
+ #if PLATFORM(COCOA)
+     explicit SharedFileHandle(MachSendRight&&);
+     MachSendRight toMachSendRight() const;
++#elif USE(UNIX_DOMAIN_SOCKETS)
++    // PS4 (Wisp): the file goes to the other process as a descriptor, as shared memory's does
++    explicit SharedFileHandle(UnixFileDescriptor&&);
++    UnixFileDescriptor toUnixFileDescriptor() const;
+ #endif
+ 
+     SharedFileHandle() = default;
+diff --git a/Source/WebKit/Platform/IPC/SharedFileHandle.serialization.in b/Source/WebKit/Platform/IPC/SharedFileHandle.serialization.in
+index ffbe0c4a..70b07cae 100644
+--- a/Source/WebKit/Platform/IPC/SharedFileHandle.serialization.in
++++ b/Source/WebKit/Platform/IPC/SharedFileHandle.serialization.in
+@@ -26,4 +26,7 @@ header: "SharedFileHandle.h"
+ #if PLATFORM(COCOA)
+     MachSendRight toMachSendRight();
+ #endif
++#if !PLATFORM(COCOA) && USE(UNIX_DOMAIN_SOCKETS)
++    UnixFileDescriptor toUnixFileDescriptor();
++#endif
+ };
+-- 
+2.53.0
+

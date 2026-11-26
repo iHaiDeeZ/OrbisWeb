@@ -1,0 +1,72 @@
+From 979f9e5577ae0ac0a2be10f7e56919efd53bcb0b Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Wed, 18 Nov 2026 01:37:16 +0300
+Subject: [PATCH 11/12] PS4 (Wisp): over-aligned fast-allocated classes get
+ aligned memory
+
+The FastMalloc fallback of TZone allocation (USE_SYSTEM_MALLOC) declared only
+operator new(size_t) in class scope, which hid the global aligned operator new:
+JSC::Lexer (JSC_CACHE_LINE_ALIGNED, 64 bytes) came from malloc 16-byte aligned,
+and code built for AVX faulted on a vmovaps into it. The class-scope aligned
+overloads take the type's alignment (and a derived class's).
+---
+ Source/WTF/wtf/FastMalloc.h | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/Source/WTF/wtf/FastMalloc.h b/Source/WTF/wtf/FastMalloc.h
+index 3b444e02..1aa69eee 100644
+--- a/Source/WTF/wtf/FastMalloc.h
++++ b/Source/WTF/wtf/FastMalloc.h
+@@ -457,6 +457,33 @@ using WTF::tryFastCompactMalloc;
+ using WTF::tryFastCompactZeroedMalloc;
+ using WTF::fastCompactAlignedMalloc;
+ 
++// Over-aligned classes (alignas above the 16 bytes malloc gives, like JSC_CACHE_LINE_ALIGNED's 64)
++// and classes derived from them: C++17 calls these overloads with the type's alignment. TZone
++// allocation honours alignment; without it (USE_SYSTEM_MALLOC) the class-scope operator new(size_t)
++// hid the global aligned one, so JSC::Lexer came out 16-byte aligned and code built for AVX
++// (vmovaps on its 64-aligned fields) faulted (Wisp v00.05 on the PS4). Aligned memory is freed with
++// fastFree, as fastAlignedMalloc's always is.
++#define WTF_FAST_ALLOCATED_ALIGNED_NEW(alignedMalloc) \
++    void* operator new(size_t size, std::align_val_t alignment) \
++    { \
++        return ::WTF::alignedMalloc(static_cast<size_t>(alignment), size); \
++    } \
++    \
++    void operator delete(void* p, std::align_val_t) \
++    { \
++        ::WTF::fastFree(p); \
++    } \
++    \
++    void* operator new[](size_t size, std::align_val_t alignment) \
++    { \
++        return ::WTF::alignedMalloc(static_cast<size_t>(alignment), size); \
++    } \
++    \
++    void operator delete[](void* p, std::align_val_t) \
++    { \
++        ::WTF::fastFree(p); \
++    } \
++
+ #define WTF_DEPRECATED_MAKE_FAST_ALLOCATED_IMPL(_type) \
+     static_assert(!WTF::usesTZoneHeap<_type>(), "Decendents of TZONE_ALLOCATED classes must also be TZONE_ALLOCATED"); \
+     \
+@@ -482,6 +509,7 @@ using WTF::fastCompactAlignedMalloc;
+     { \
+         ::WTF::fastFree(p); \
+     } \
++    WTF_FAST_ALLOCATED_ALIGNED_NEW(fastAlignedMalloc) \
+     void* operator new(size_t, NotNullTag, void* location) \
+     { \
+         ASSERT(location); \
+@@ -519,6 +547,7 @@ using WTF::fastCompactAlignedMalloc;
+     { \
+         ::WTF::fastFree(p); \
+     } \
++    WTF_FAST_ALLOCATED_ALIGNED_NEW(fastCompactAlignedMalloc) \
+     void* operator new(size_t, NotNullTag, void* location) \
+     { \
+         ASSERT(location); \
+-- 
+2.53.0
+

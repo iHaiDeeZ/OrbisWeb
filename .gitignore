@@ -1,0 +1,6 @@
+# Never in the repository: console logs (browsing history), packages, promo videos (game footage)
+logs/
+out/
+promo/
+__pycache__/
+*.pyc

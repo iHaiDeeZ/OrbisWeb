@@ -1,0 +1,283 @@
+From 19fb790982e300d0b642771ca91afc8ab1d59e21 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Thu, 19 Nov 2026 22:18:00 +0300
+Subject: [PATCH] PS4 (Wisp): less of the memory the app's processes share:
+ hidden pages give their frame buffers back, font files read instead of
+ mapped, cached resources sent inline, hidden pages throttled
+
+---
+ Source/ThirdParty/skia/src/core/SkData.cpp    | 42 +++++++++++++++++++
+ .../NetworkProcess/cache/NetworkCache.cpp     |  3 +-
+ .../cache/NetworkCacheEntry.cpp               |  7 ++++
+ .../UIProcess/API/glib/WebKitSettings.cpp     |  6 +++
+ .../UIProcess/wpe/AcceleratedBackingStore.cpp |  9 +++-
+ .../AcceleratedSurface.cpp                    | 18 ++++++++
+ .../CoordinatedGraphics/AcceleratedSurface.h  |  4 ++
+ .../NonCompositedFrameRenderer.cpp            | 16 +++++++
+ .../NonCompositedFrameRenderer.h              |  4 ++
+ 9 files changed, 107 insertions(+), 2 deletions(-)
+
+diff --git a/Source/ThirdParty/skia/src/core/SkData.cpp b/Source/ThirdParty/skia/src/core/SkData.cpp
+index 4c853b41..8e7d8dc4 100644
+--- a/Source/ThirdParty/skia/src/core/SkData.cpp
++++ b/Source/ThirdParty/skia/src/core/SkData.cpp
+@@ -12,6 +12,11 @@
+ #include "include/private/SkAssert.h"
+ #include "include/private/SkMalloc.h"
+ #include "src/core/SkOSFile.h"
++
++#if defined(__ORBIS__)
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
+ #include "src/core/SkStreamPriv.h"
+ 
+ #include <cstddef>
+@@ -171,6 +176,21 @@ static void sk_mmap_releaseproc(const void* addr, void* ctx) {
+ }
+ 
+ sk_sp<SkData> SkData::MakeFromFILE(FILE* f) {
++#if defined(__ORBIS__)
++    // PS4 (Wisp): a file mapping comes out of the memory pool the app's processes share (each font a page
++    // used: 23 MiB in v00.13's web process, a CJK face alone 20 MiB); the heap is direct memory
++    {
++        const size_t length = sk_fgetsize(f);
++        if (!length) {
++            return nullptr;
++        }
++        sk_sp<SkData> data = SkData::MakeUninitialized(length);
++        if (sk_qread(f, data->writable_data(), length, 0) != length) {
++            return nullptr;
++        }
++        return data;
++    }
++#else
+     size_t size;
+     void* addr = sk_fmmap(f, &size);
+     if (nullptr == addr) {
+@@ -178,6 +198,7 @@ sk_sp<SkData> SkData::MakeFromFILE(FILE* f) {
+     }
+ 
+     return SkData::MakeWithProc(addr, size, sk_mmap_releaseproc, reinterpret_cast<void*>(size));
++#endif
+ }
+ 
+ sk_sp<SkData> SkData::MakeFromFileName(const char path[]) {
+@@ -191,12 +212,33 @@ sk_sp<SkData> SkData::MakeFromFileName(const char path[]) {
+ }
+ 
+ sk_sp<SkData> SkData::MakeFromFD(int fd) {
++#if defined(__ORBIS__)
++    // PS4 (Wisp): read, not mapped (MakeFromFILE)
++    {
++        struct stat status;
++        if (fstat(fd, &status) || status.st_size <= 0) {
++            return nullptr;
++        }
++        const size_t length = static_cast<size_t>(status.st_size);
++        sk_sp<SkData> data = SkData::MakeUninitialized(length);
++        size_t done = 0;
++        while (done < length) {
++            const ssize_t n = pread(fd, static_cast<char*>(data->writable_data()) + done, length - done, static_cast<off_t>(done));
++            if (n <= 0) {
++                return nullptr;
++            }
++            done += static_cast<size_t>(n);
++        }
++        return data;
++    }
++#else
+     size_t size;
+     void* addr = sk_fdmmap(fd, &size);
+     if (nullptr == addr) {
+         return nullptr;
+     }
+     return SkData::MakeWithProc(addr, size, sk_mmap_releaseproc, reinterpret_cast<void*>(size));
++#endif
+ }
+ 
+ sk_sp<SkData> SkData::MakeWithCString(const char cstr[]) {
+diff --git a/Source/WebKit/NetworkProcess/cache/NetworkCache.cpp b/Source/WebKit/NetworkProcess/cache/NetworkCache.cpp
+index 04b85218..590d5a25 100644
+--- a/Source/WebKit/NetworkProcess/cache/NetworkCache.cpp
++++ b/Source/WebKit/NetworkProcess/cache/NetworkCache.cpp
+@@ -564,7 +564,8 @@ std::unique_ptr<Entry> Cache::store(const WebCore::ResourceRequest& request, con
+ 
+     m_storage->store(record, [protectedThis = Ref { *this }, completionHandler = WTF::move(completionHandler)](const Data& bodyData) mutable {
+         MappedBody mappedBody;
+-#if ENABLE(SHAREABLE_RESOURCE)
++#if ENABLE(SHAREABLE_RESOURCE) && !defined(__ORBIS__)
++        // (PS4, Wisp: not shared - see NetworkCacheEntry.cpp)
+         if (auto sharedMemory = bodyData.tryCreateSharedMemory()) {
+             mappedBody.shareableResource = WebCore::ShareableResource::create(sharedMemory.releaseNonNull(), 0, bodyData.size());
+             if (!mappedBody.shareableResource) {
+diff --git a/Source/WebKit/NetworkProcess/cache/NetworkCacheEntry.cpp b/Source/WebKit/NetworkProcess/cache/NetworkCacheEntry.cpp
+index ad4837e5..017672c0 100644
+--- a/Source/WebKit/NetworkProcess/cache/NetworkCacheEntry.cpp
++++ b/Source/WebKit/NetworkProcess/cache/NetworkCacheEntry.cpp
+@@ -204,6 +204,12 @@ WebCore::FragmentedSharedBuffer* Entry::buffer() const
+ #if ENABLE(SHAREABLE_RESOURCE)
+ std::optional<WebCore::ShareableResource::Handle> Entry::shareableResourceHandle() const
+ {
++#if defined(__ORBIS__)
++    // PS4 (Wisp): a cached body as shared memory is mapped in the web process for as long as WebKit keeps
++    // the resource, out of the memory pool the app's processes share (17 MiB in 26 mappings in v00.13);
++    // sent inline it lands in the web process's heap (direct memory)
++    return std::nullopt;
++#else
+     if (RefPtr shareableResource = m_shareableResource)
+         return shareableResource->createHandle();
+ 
+@@ -216,6 +222,7 @@ std::optional<WebCore::ShareableResource::Handle> Entry::shareableResourceHandle
+     if (shareableResource)
+         return shareableResource->createHandle();
+     return std::nullopt;
++#endif
+ }
+ #endif
+ 
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitSettings.cpp b/Source/WebKit/UIProcess/API/glib/WebKitSettings.cpp
+index fde4c6ec..42562393 100644
+--- a/Source/WebKit/UIProcess/API/glib/WebKitSettings.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitSettings.cpp
+@@ -74,6 +74,12 @@ struct _WebKitSettingsPrivate {
+         defaultCharset = preferences->defaultTextEncodingName().utf8();
+ #if ENABLE(WEB_RTC)
+         webrtcUDPPortsRange = preferences->webRTCUDPPortRange().utf8();
++#endif
++#if defined(__ORBIS__)
++        // PS4 (Wisp): every tab shares one web process and its main thread, and JavaScript is interpreted:
++        // a hidden page's timers and animations at full speed froze the tab on screen (v00.13: 8-31 s)
++        preferences->setHiddenPageDOMTimerThrottlingEnabled(true);
++        preferences->setHiddenPageCSSAnimationSuspensionEnabled(true);
+ #endif
+     }
+ 
+diff --git a/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp b/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp
+index d29152b8..b2db67cb 100644
+--- a/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp
++++ b/Source/WebKit/UIProcess/wpe/AcceleratedBackingStore.cpp
+@@ -188,8 +188,15 @@ void AcceleratedBackingStore::didCreateAndroidBuffer(uint64_t id, RefPtr<AHardwa
+ 
+ void AcceleratedBackingStore::didDestroyBuffer(uint64_t id)
+ {
+-    if (auto buffer = m_buffers.take(id))
++    if (auto buffer = m_buffers.take(id)) {
+         m_bufferIDs.remove(buffer.get());
++#if defined(__ORBIS__)
++        // PS4 (Wisp): the UI copied the frame (its WPEView keeps the pixels); the committed buffer only
++        // kept 7.5 MiB of shared memory mapped after a hidden page gave it back
++        if (m_committedBuffer.get() == buffer.get())
++            m_committedBuffer = nullptr;
++#endif
++    }
+ 
+     notifyBufferConfigurationIfNeeded();
+ }
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+index bf0363a7..689640e5 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+@@ -976,10 +976,20 @@ void AcceleratedSurface::visibilityDidChange(bool isVisible)
+         auto& timer = protectedThis->m_releaseUnusedBuffersTimer;
+         if (!timer)
+             return;
++#if defined(__ORBIS__)
++        protectedThis->m_releaseReturningBuffers = false;
++#endif
+         if (isVisible)
+             timer->stop();
+         else {
++#if defined(__ORBIS__)
++            // PS4 (Wisp): each buffer (7.5 MiB for a 1920x972 page) is mapped here and in the UI, out of
++            // the memory pool the app's processes share; a hidden tab kept two for 10-20 s, and three tabs
++            // left that pool empty (v00.13). The UI keeps a copy of the page's last frame.
++            static const Seconds releaseUnusedBuffersDelay = 1_s;
++#else
+             static const Seconds releaseUnusedBuffersDelay = 10_s;
++#endif
+             timer->startOneShot(releaseUnusedBuffersDelay);
+         }
+     });
+@@ -1008,6 +1018,10 @@ void AcceleratedSurface::backgroundColorDidChange()
+ void AcceleratedSurface::releaseUnusedBuffersTimerFired()
+ {
+     m_swapChain.releaseUnusedBuffers();
++#if defined(__ORBIS__)
++    // PS4 (Wisp): the page is still hidden; the buffers the UI still has go too, as they come back
++    m_releaseReturningBuffers = true;
++#endif
+ }
+ 
+ void AcceleratedSurface::didCreateCompositingRunLoop(RunLoop& runLoop)
+@@ -1195,6 +1209,10 @@ void AcceleratedSurface::releaseBuffer(uint64_t targetID, UnixFileDescriptor&& r
+     ASSERT(m_swapChain.type() != SwapChain::Type::WPEBackend);
+ #endif
+     m_swapChain.releaseTarget(targetID, WTF::move(releaseFence));
++#if defined(__ORBIS__)
++    if (m_releaseReturningBuffers)
++        m_swapChain.releaseUnusedBuffers();
++#endif
+ }
+ #endif
+ 
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
+index 1bbcac1d..6c657b5b 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
+@@ -500,6 +500,10 @@ private:
+     bool m_isVisible { false };
+     bool m_useExplicitSync { false };
+     std::unique_ptr<RunLoop::Timer> m_releaseUnusedBuffersTimer;
++#if defined(__ORBIS__)
++    // PS4 (Wisp): hidden long enough that buffers coming back from the UI are released (compositing run loop)
++    bool m_releaseReturningBuffers { false };
++#endif
+     RefPtr<WTF::RunLoop> m_compositingRunLoop;
+ #if ENABLE(DAMAGE_TRACKING)
+     SwapChainDamageTracker m_damageTracker;
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
+index fc8508ac..14f4196e 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.cpp
+@@ -514,6 +514,22 @@ void NonCompositedFrameRenderer::fillGLInformation(RenderProcessInfo&& info, Com
+     completionHandler(WTF::move(info));
+ }
+ 
++#if defined(__ORBIS__)
++// PS4 (Wisp): a hidden page gives its frame buffers back, as the threaded compositor has its surface
++// do (AcceleratedSurface::visibilityDidChange)
++void NonCompositedFrameRenderer::suspend()
++{
++    FrameRenderer::suspend();
++    m_surface->visibilityDidChange(false);
++}
++
++void NonCompositedFrameRenderer::resume()
++{
++    m_surface->visibilityDidChange(true);
++    FrameRenderer::resume();
++}
++#endif
++
+ void NonCompositedFrameRenderer::releaseMemory(WTF::Critical critical)
+ {
+     if (m_context)
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.h b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.h
+index d70876de..cfb9d969 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.h
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/NonCompositedFrameRenderer.h
+@@ -79,6 +79,10 @@ private:
+ #endif
+ 
+     void releaseMemory(WTF::Critical) override;
++#if defined(__ORBIS__)
++    void suspend() override;
++    void resume() override;
++#endif
+ 
+     const WeakRef<WebPage> m_webPage;
+     Ref<AcceleratedSurface> m_surface;
+-- 
+2.53.0
+

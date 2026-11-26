@@ -1,0 +1,321 @@
+From 312972c05689c99c54fab850da5e3d0f10753864 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Wed, 25 Nov 2026 14:07:39 +0300
+Subject: [PATCH] PS4 (Wisp): WebAssembly memories grow in place; pages never
+ take the kernel's memory
+
+A WebAssembly memory that is not shared grew by copying into a new memory (Memory::grow, bounds
+checking): the old memory and the new one at once. An N64 emulator's 512 MiB growing to 758 MiB needed
+1.27 GiB of direct memory and was refused (OrbisWeb v00.35). On the PS4 such a memory is now reserved to
+its maximum (2 GiB when it names none) with memory for its initial size only: bmalloc's large allocation
+takes a commit size for the next allocation on the thread (wtf_ps4_large_commit_next), and a grow gives
+the new part memory in place (wtf_ps4_commit) and the same memory to a new handle. The handles on such a
+memory are counted (BufferMemoryHandle.cpp): the old one lives on a while in the memory's old ArrayBuffer,
+and the reservation goes, whole, with the last.
+
+The system heap's large allocations come cleared on the PS4 (direct memory as it is mapped, or a fresh
+mapping of the kernel's), and bmalloc does not clear them again: with a reservation, clearing all of it
+would touch the part not mapped.
+
+WebKit's pages never fall back to flexible memory while direct memory works. The system pool holds the
+kernel's own objects ("ScePthread internal memory"): once a game's WebAssembly memory and a video had used
+up direct memory, pages committed there left the kernel none, and the PS4 ended the whole app (v00.34,
+v00.35). The app's own pool is shared by its processes, and an empty one freezes the app. A commit that
+finds no direct memory now fails (said in the log), and the process ends rather than the app. The kernel
+is asked for a block of direct memory every time (it was asked only every 64th time after it had none).
+---
+ .../runtime/BufferMemoryHandle.cpp            | 54 +++++++++++++++++
+ Source/JavaScriptCore/wasm/WasmMemory.cpp     | 39 +++++++++++++
+ Source/WTF/wtf/ps4/OSAllocatorPS4.cpp         | 58 +++++++++++++++----
+ Source/bmalloc/bmalloc/bmalloc.cpp            | 13 ++++-
+ 4 files changed, 150 insertions(+), 14 deletions(-)
+
+diff --git a/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp b/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
+index d060e6b9..84012cca 100644
+--- a/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
++++ b/Source/JavaScriptCore/runtime/BufferMemoryHandle.cpp
+@@ -33,6 +33,7 @@
+ #include <mutex>
+ #include <wtf/DataLog.h>
+ #include <wtf/FastMalloc.h>
++#include <wtf/HashMap.h>
+ #include <wtf/Lock.h>
+ #include <wtf/NeverDestroyed.h>
+ #include <wtf/OSAllocator.h>
+@@ -253,6 +254,53 @@ void* BufferMemoryHandle::nullBasePointer()
+     return result;
+ }
+ 
++#if defined(__ORBIS__)
++// (PS4, Wisp, v00.36) WebAssembly memories that are not shared and grow in place (wasm/WasmMemory.cpp): the
++// maximum reserved, the part in use given memory. A grow gives the new part memory and the same memory to a
++// new handle (the old one lives on a while, in the memory's old ArrayBuffer): it is freed with the last.
++namespace {
++struct WispReservation {
++    size_t reserved { 0 };
++    unsigned handles { 0 };
++};
++Lock wispReservationsLock;
++HashMap<uintptr_t, WispReservation>& wispReservations() WTF_REQUIRES_LOCK(wispReservationsLock)
++{
++    static NeverDestroyed<HashMap<uintptr_t, WispReservation>> map;
++    return map.get();
++}
++}
++
++// How much the memory at base has reserved (0: not one of these)
++size_t wispReservedBytes(void* base)
++{
++    Locker locker { wispReservationsLock };
++    auto it = wispReservations().find(reinterpret_cast<uintptr_t>(base));
++    return it == wispReservations().end() ? 0 : it->value.reserved;
++}
++
++// Another handle on the memory at base (the first one says how much it reserved)
++void wispAddReservationHandle(void* base, size_t reserved)
++{
++    Locker locker { wispReservationsLock };
++    auto& entry = wispReservations().add(reinterpret_cast<uintptr_t>(base), WispReservation { reserved, 0 }).iterator->value;
++    entry.handles++;
++}
++
++// A handle on it goes: true while others still have it (nothing to free yet)
++static bool wispReleaseReservationHandle(void* base)
++{
++    Locker locker { wispReservationsLock };
++    auto it = wispReservations().find(reinterpret_cast<uintptr_t>(base));
++    if (it == wispReservations().end())
++        return false;
++    if (--it->value.handles)
++        return true;
++    wispReservations().remove(it);
++    return false;
++}
++#endif
++
+ BufferMemoryHandle::~BufferMemoryHandle()
+ {
+     if (m_memory) {
+@@ -272,6 +320,12 @@ BufferMemoryHandle::~BufferMemoryHandle()
+             case MemorySharingMode::Default: {
+                 if (memory == nullBasePointer() && !m_size)
+                     return;
++#if defined(__ORBIS__)
++                // (a newer handle has this memory: it grew in place; its reservation goes with the last one,
++                // whole: bmalloc's system heap keeps its reserved size)
++                if (wispReleaseReservationHandle(memory))
++                    break;
++#endif
+                 Gigacage::freeVirtualPages(Gigacage::Primitive, memory, m_size);
+                 break;
+             }
+diff --git a/Source/JavaScriptCore/wasm/WasmMemory.cpp b/Source/JavaScriptCore/wasm/WasmMemory.cpp
+index cf9277df..961a584f 100644
+--- a/Source/JavaScriptCore/wasm/WasmMemory.cpp
++++ b/Source/JavaScriptCore/wasm/WasmMemory.cpp
+@@ -48,10 +48,19 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
+ #if defined(__ORBIS__)
+ // PS4 (Wisp): memory into part of a reservation (WTF's ps4/OSAllocatorPS4.cpp); false when none is left
+ extern "C" bool wtf_ps4_commit(void* address, size_t bytes);
++// (v00.36) the next large allocation on this thread gets memory for this much only; direct memory usable
++extern "C" void wtf_ps4_large_commit_next(size_t bytes);
++extern "C" bool wtf_ps4_direct_memory_usable();
+ #endif
+ 
+ namespace JSC {
+ 
++#if defined(__ORBIS__)
++// (v00.36, runtime/BufferMemoryHandle.cpp) WebAssembly memories reserved to their maximum
++size_t wispReservedBytes(void* base);
++void wispAddReservationHandle(void* base, size_t reserved);
++#endif
++
+ namespace Wasm {
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(Memory);
+@@ -214,6 +223,23 @@ RefPtr<Memory> Memory::tryCreate(VM& vm, PageCount initial, PageCount maximum, M
+         if (!initialBytes)
+             return adoptRef(new Memory(initial, maximum, MemorySharingMode::Default, addressType, WTF::move(growSuccessCallback)));
+ 
++#if defined(__ORBIS__)
++        // (PS4, Wisp, v00.36) Reserved to its maximum (2 GiB when it says none), memory for its initial size
++        // only: a grow then gives the new part memory in place (grow, below). A grow by copy needs the old
++        // memory and the new at once: an N64 emulator's 512 -> 758 MiB was refused (v00.35).
++        if (wtf_ps4_direct_memory_usable()) {
++            const size_t limit = static_cast<size_t>(MAX_ARRAY_BUFFER_SIZE);
++            const size_t reserve = std::max<size_t>(initialBytes, std::min<size_t>(maximum ? static_cast<size_t>(maximumBytes) : (static_cast<size_t>(2) << 30), limit));
++            if (reserve > initialBytes) {
++                wtf_ps4_large_commit_next(initialBytes);
++                if (void* memory = Gigacage::tryAllocateZeroedVirtualPages(Gigacage::Primitive, reserve)) {
++                    wispAddReservationHandle(memory, reserve);
++                    return Memory::create(adoptRef(*new BufferMemoryHandle(memory, initialBytes, initialBytes, initial, maximum, MemorySharingMode::Default, MemoryMode::BoundsChecking)), addressType, WTF::move(growSuccessCallback));
++                }
++                wtf_ps4_large_commit_next(0);
++            }
++        }
++#endif
+         void* slowMemory = Gigacage::tryAllocateZeroedVirtualPages(Gigacage::Primitive, initialBytes);
+         if (!slowMemory) {
+             BufferMemoryManager::singleton().freePhysicalBytes(initialBytes);
+@@ -361,6 +387,19 @@ Expected<PageCount, GrowFailReason> Memory::grow(VM& vm, PageCount delta)
+ 
+         RELEASE_ASSERT(maximum().bytes() != 0);
+ 
++#if defined(__ORBIS__)
++        // (PS4, Wisp, v00.36) reserved to its maximum: the new part gets memory where it is, and a new handle
++        // has the same memory (the old one's ArrayBuffer may outlive this grow)
++        if (void* base = basePointer(); base && wispReservedBytes(base) >= desiredSize) {
++            if (!wtf_ps4_commit(static_cast<uint8_t*>(base) + size(), desiredSize - size()))
++                return makeUnexpected(GrowFailReason::OutOfMemory);
++            auto grown = adoptRef(*new BufferMemoryHandle(base, desiredSize, desiredSize, initial(), maximum(), sharingMode(), MemoryMode::BoundsChecking));
++            wispAddReservationHandle(base, 0);
++            m_handle->transferAnchors(grown.get());
++            m_handle = WTF::move(grown);
++            return success();
++        }
++#endif
+         void* newMemory = Gigacage::tryAllocateZeroedVirtualPages(Gigacage::Primitive, desiredSize);
+         if (!newMemory)
+             return makeUnexpected(GrowFailReason::OutOfMemory);
+diff --git a/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp b/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp
+index c03019f2..1463a5ca 100644
+--- a/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp
++++ b/Source/WTF/wtf/ps4/OSAllocatorPS4.cpp
+@@ -39,6 +39,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <utility>
+ #include <errno.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -268,16 +269,11 @@ unsigned takePages(size_t wanted, off_t& physical)
+         }
+     }
+     if (!length) {
+-        // (when the kernel had no block, it is asked again only every 64th time: flexible memory meanwhile)
+-        if (blockRetryIn) {
+-            --blockRetryIn;
+-            return 0;
+-        }
++        // (v00.36: the kernel is asked each time; up to v00.35 it was asked only every 64th time after it had
++        // none, flexible memory meanwhile, which WebKit's pages no longer take)
+         chosen = addBlock();
+-        if (!chosen) {
+-            blockRetryIn = 64;
++        if (!chosen)
+             return 0;
+-        }
+         first = 0;
+         length = limit;
+     }
+@@ -475,6 +471,12 @@ bool returnDirectMemory(uintptr_t begin, uintptr_t end)
+     return all;
+ }
+ 
++size_t wtf_ps4_page_memory_held()
++{
++    Locker locker { poolLock };
++    return static_cast<size_t>(blockCount) * blockSize;
++}
++
+ // Memory over [begin, end) (kernel pages), replacing the reservation there: direct memory, flexible
+ // memory for what direct memory did not cover (unless `flexibleToo` is false and direct memory works:
+ // JavaScript's large buffers, see wtf_ps4_commit)
+@@ -492,6 +494,20 @@ bool mapMemory(uintptr_t begin, uintptr_t end, int protection, const char* name,
+         noteBuffersRefused(end - start);
+         return false;
+     }
++    if (direct) {
++        // (v00.36) No flexible memory for WebKit's pages while direct memory works. The system pool holds
++        // the kernel's own objects ("ScePthread internal memory"): after a game's WebAssembly memory and a
++        // video used up direct memory, pages committed there left the kernel none, and the PS4 ended the
++        // whole app (v00.34, v00.35). The app's pool is the one its processes share: empty, the app freezes.
++        // Refused, the commit stops this process instead (its pages say they stopped working).
++        static std::atomic<unsigned> notes { 0 };
++        if (notes.fetch_add(1, std::memory_order_relaxed) < 4)
++            fprintf(stderr, "WTF::OSAllocator (PS4): no direct memory left for %zu KiB of WebKit's pages (the pool holds %zu MiB): no flexible memory taken\n",
++                static_cast<size_t>(end - begin) >> 10, wtf_ps4_page_memory_held() >> 20);
++        if (begin > start && !returnDirectMemory(start, begin))
++            reserveAgain(start, begin);
++        return false;
++    }
+     void* address = reinterpret_cast<void*>(begin);
+     const size_t bytes = end - begin;
+     int result = sceKernelMapNamedSystemFlexibleMemory(&address, bytes, protection, kernelMapFixed, name);
+@@ -751,9 +767,26 @@ extern "C" bool wtf_ps4_commit(void* address, size_t bytes)
+ // shared, each grow's new copy, other large zeroed buffers): a reservation with direct memory in it, not
+ // cleared (bmalloc clears it), and only direct memory. `handled` false: no usable direct memory on this
+ // console, and the caller maps memory its own way.
++namespace {
++// (v00.36) What the next large allocation on this thread commits, when less than all of it
++// (wtf_ps4_large_commit_next: a WebAssembly memory reserved to its maximum, wasm/WasmMemory.cpp)
++thread_local size_t largeCommitNext = 0;
++}
++
++extern "C" void wtf_ps4_large_commit_next(size_t bytes)
++{
++    largeCommitNext = bytes;
++}
++
++extern "C" bool wtf_ps4_direct_memory_usable()
++{
++    return useDirectMemory();
++}
++
+ extern "C" void* wtf_ps4_large_allocate(size_t bytes, size_t alignment, bool* handled)
+ {
+     *handled = useDirectMemory();
++    const size_t commitOnly = std::exchange(largeCommitNext, 0);
+     if (!*handled)
+         return nullptr;
+     bytes = pageUp(bytes);
+@@ -767,12 +800,15 @@ extern "C" void* wtf_ps4_large_allocate(size_t bytes, size_t alignment, bool* ha
+         Locker locker { poolLock };
+         blockRetryIn = 0;
+     }
+-    const uintptr_t reached = mapDirectMemory(begin, end, kernelProtRead | kernelProtWrite, "WebKit buffers", false);
+-    if (reached != end) {
++    // (cleared here: bmalloc leaves it to this; v00.36 commits only `commitOnly` when asked, the rest
++    // stays address space for wtf_ps4_commit as the buffer grows)
++    const uintptr_t commitEnd = commitOnly ? std::min<uintptr_t>(end, begin + pageUp(commitOnly)) : end;
++    const uintptr_t reached = mapDirectMemory(begin, commitEnd, kernelProtRead | kernelProtWrite, "WebKit buffers", true);
++    if (reached != commitEnd) {
+         if (reached > begin)
+             returnDirectMemory(begin, reached);
+         sceKernelMunmap(base, bytes);
+-        noteBuffersRefused(bytes);
++        noteBuffersRefused(commitEnd - begin);
+         return nullptr;
+     }
+     return base;
+diff --git a/Source/bmalloc/bmalloc/bmalloc.cpp b/Source/bmalloc/bmalloc/bmalloc.cpp
+index c419f193..08fc8a2b 100644
+--- a/Source/bmalloc/bmalloc/bmalloc.cpp
++++ b/Source/bmalloc/bmalloc/bmalloc.cpp
+@@ -81,12 +81,19 @@ void* tryLargeZeroedMemalignVirtual(size_t requiredAlignment, size_t requestedSi
+     RELEASE_BASSERT(size >= requestedSize);
+ 
+     void* result;
+-    if (auto* systemHeap = SystemHeap::tryGetIfShouldSupplantBmalloc())
++    bool cleared = false;
++    if (auto* systemHeap = SystemHeap::tryGetIfShouldSupplantBmalloc()) {
+         result = systemHeap->memalignLarge(alignment, size);
+-    else
++#if defined(__ORBIS__)
++        // (PS4, Wisp, v00.36) cleared already: direct memory as it is mapped (WTF's OSAllocatorPS4.cpp), else
++        // a fresh mapping of the kernel's; and a WebAssembly memory reserved to its maximum has only its
++        // first part mapped (wasm/WasmMemory.cpp): clearing all of it here would touch the rest
++        cleared = true;
++#endif
++    } else
+         result = tryMemalign(alignment, size, mode, kind);
+ 
+-    if (result) {
++    if (result && !cleared) {
+ #if defined(__ORBIS__)
+         // (PS4, Wisp) The memory came from the kit's mmap, direct memory, and vmZeroAndPurge maps
+         // anonymous memory MAP_FIXED over it to zero it: the PS4 refuses that mapping, and the
+-- 
+2.53.0
+

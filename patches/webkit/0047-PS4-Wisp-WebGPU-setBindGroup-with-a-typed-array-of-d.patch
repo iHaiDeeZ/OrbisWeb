@@ -1,0 +1,95 @@
+From 52f1d112db72c1fa0e57f1a4ad067281deced69e Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Thu, 26 Nov 2026 01:46:29 +0300
+Subject: [PATCH] PS4 (Wisp): WebGPU setBindGroup with a typed array of dynamic
+ offsets
+
+setBindGroup(index, bindGroup, Uint32Array, start, length) reaches the Implementation layer as a span.
+Upstream only gets there through the GPU process, which turns the array into a Vector first, so the
+span overloads were RELEASE_ASSERT_NOT_REACHED; with WebGPU in the web process (0039) a page calling
+that form aborted the process (v00.42: Mortal Kombat's WebGPU page, twice).
+
+The compute pass, render pass and render bundle encoders pass the subspan to Dawn; the GPU* callers
+check start + length against the array's length already.
+---
+ .../WebGPUComputePassEncoderImpl.cpp             | 10 ++++++++--
+ .../WebGPURenderBundleEncoderImpl.cpp            | 16 +++++++++++-----
+ .../WebGPURenderPassEncoderImpl.cpp              | 12 +++++++++---
+ 3 files changed, 28 insertions(+), 10 deletions(-)
+
+diff --git a/Source/WebCore/Modules/WebGPU/Implementation/WebGPUComputePassEncoderImpl.cpp b/Source/WebCore/Modules/WebGPU/Implementation/WebGPUComputePassEncoderImpl.cpp
+index 7626e159..2efd67b6 100644
+--- a/Source/WebCore/Modules/WebGPU/Implementation/WebGPUComputePassEncoderImpl.cpp
++++ b/Source/WebCore/Modules/WebGPU/Implementation/WebGPUComputePassEncoderImpl.cpp
+@@ -74,9 +74,15 @@ void ComputePassEncoderImpl::setBindGroup(Index32 index, const BindGroup* bindGr
+     wgpuComputePassEncoderSetBindGroup(m_backing.get(), index, bindGroup ? m_convertToBackingContext->convertToBacking(*bindGroup) : nullptr, backingOffsets.size(), backingOffsets.span().data());
+ }
+ 
+-void ComputePassEncoderImpl::setBindGroup(Index32, const BindGroup*, std::span<const uint32_t>, Size64, Size32)
++void ComputePassEncoderImpl::setBindGroup(Index32 index, const BindGroup* bindGroup, std::span<const uint32_t> dynamicOffsetsArrayBuffer, Size64 dynamicOffsetsDataStart, Size32 dynamicOffsetsDataLength)
+ {
+-    RELEASE_ASSERT_NOT_REACHED();
++    // PS4 (Wisp): the typed-array form, called here directly: WebKit's own WebGPU reaches this layer only
++    // through its GPU process, which turns the array into a Vector first, so upstream left this one
++    // unreachable (RELEASE_ASSERT_NOT_REACHED). A page passing its dynamic offsets in a Uint32Array
++    // aborted the web process (v00.42: Mortal Kombat's WebGPU page, twice). GPUComputePassEncoder and
++    // the others checked start + length against the array's length already.
++    auto offsets = dynamicOffsetsArrayBuffer.subspan(static_cast<size_t>(dynamicOffsetsDataStart), dynamicOffsetsDataLength);
++    wgpuComputePassEncoderSetBindGroup(m_backing.get(), index, bindGroup ? m_convertToBackingContext->convertToBacking(*bindGroup) : nullptr, offsets.size(), offsets.data());
+ }
+ 
+ void ComputePassEncoderImpl::pushDebugGroup(String&& groupLabel)
+diff --git a/Source/WebCore/Modules/WebGPU/Implementation/WebGPURenderBundleEncoderImpl.cpp b/Source/WebCore/Modules/WebGPU/Implementation/WebGPURenderBundleEncoderImpl.cpp
+index c7070905..b54519e0 100644
+--- a/Source/WebCore/Modules/WebGPU/Implementation/WebGPURenderBundleEncoderImpl.cpp
++++ b/Source/WebCore/Modules/WebGPU/Implementation/WebGPURenderBundleEncoderImpl.cpp
+@@ -93,12 +93,18 @@ void RenderBundleEncoderImpl::setBindGroup(Index32 index, const BindGroup* bindG
+     wgpuRenderBundleEncoderSetBindGroup(m_backing.get(), index, bindGroup ? m_convertToBackingContext->convertToBacking(*bindGroup) : nullptr, backingOffsets.size(), backingOffsets.span().data());
+ }
+ 
+-void RenderBundleEncoderImpl::setBindGroup(Index32, const BindGroup*,
+-    std::span<const uint32_t>,
+-    Size64,
+-    Size32)
++void RenderBundleEncoderImpl::setBindGroup(Index32 index, const BindGroup* bindGroup,
++    std::span<const uint32_t> dynamicOffsetsArrayBuffer,
++    Size64 dynamicOffsetsDataStart,
++    Size32 dynamicOffsetsDataLength)
+ {
+-    RELEASE_ASSERT_NOT_REACHED();
++    // PS4 (Wisp): the typed-array form, called here directly: WebKit's own WebGPU reaches this layer only
++    // through its GPU process, which turns the array into a Vector first, so upstream left this one
++    // unreachable (RELEASE_ASSERT_NOT_REACHED). A page passing its dynamic offsets in a Uint32Array
++    // aborted the web process (v00.42: Mortal Kombat's WebGPU page, twice). GPUComputePassEncoder and
++    // the others checked start + length against the array's length already.
++    auto offsets = dynamicOffsetsArrayBuffer.subspan(static_cast<size_t>(dynamicOffsetsDataStart), dynamicOffsetsDataLength);
++    wgpuRenderBundleEncoderSetBindGroup(m_backing.get(), index, bindGroup ? m_convertToBackingContext->convertToBacking(*bindGroup) : nullptr, offsets.size(), offsets.data());
+ }
+ 
+ void RenderBundleEncoderImpl::pushDebugGroup(String&& groupLabel)
+diff --git a/Source/WebCore/Modules/WebGPU/Implementation/WebGPURenderPassEncoderImpl.cpp b/Source/WebCore/Modules/WebGPU/Implementation/WebGPURenderPassEncoderImpl.cpp
+index 0b1014ba..320d842b 100644
+--- a/Source/WebCore/Modules/WebGPU/Implementation/WebGPURenderPassEncoderImpl.cpp
++++ b/Source/WebCore/Modules/WebGPU/Implementation/WebGPURenderPassEncoderImpl.cpp
+@@ -94,9 +94,15 @@ void RenderPassEncoderImpl::setBindGroup(Index32 index, const BindGroup* bindGro
+     wgpuRenderPassEncoderSetBindGroup(m_backing.get(), index, bindGroup ? m_convertToBackingContext->convertToBacking(*bindGroup) : nullptr, backingOffsets.size(), backingOffsets.span().data());
+ }
+ 
+-void RenderPassEncoderImpl::setBindGroup(Index32, const BindGroup*, std::span<const uint32_t>, Size64, Size32)
+-{
+-    RELEASE_ASSERT_NOT_REACHED();
++void RenderPassEncoderImpl::setBindGroup(Index32 index, const BindGroup* bindGroup, std::span<const uint32_t> dynamicOffsetsArrayBuffer, Size64 dynamicOffsetsDataStart, Size32 dynamicOffsetsDataLength)
++{
++    // PS4 (Wisp): the typed-array form, called here directly: WebKit's own WebGPU reaches this layer only
++    // through its GPU process, which turns the array into a Vector first, so upstream left this one
++    // unreachable (RELEASE_ASSERT_NOT_REACHED). A page passing its dynamic offsets in a Uint32Array
++    // aborted the web process (v00.42: Mortal Kombat's WebGPU page, twice). GPUComputePassEncoder and
++    // the others checked start + length against the array's length already.
++    auto offsets = dynamicOffsetsArrayBuffer.subspan(static_cast<size_t>(dynamicOffsetsDataStart), dynamicOffsetsDataLength);
++    wgpuRenderPassEncoderSetBindGroup(m_backing.get(), index, bindGroup ? m_convertToBackingContext->convertToBacking(*bindGroup) : nullptr, offsets.size(), offsets.data());
+ }
+ 
+ void RenderPassEncoderImpl::pushDebugGroup(String&& groupLabel)
+-- 
+2.53.0
+

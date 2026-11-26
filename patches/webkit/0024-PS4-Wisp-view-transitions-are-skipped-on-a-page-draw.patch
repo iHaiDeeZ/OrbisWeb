@@ -1,0 +1,51 @@
+From e71dd115f72b16cedc632ff916643e49b98de3f6 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Fri, 20 Nov 2026 06:40:19 +0300
+Subject: [PATCH] PS4 (Wisp): view transitions are skipped on a page drawn
+ without compositing
+
+A web process without GL draws on the CPU without compositing (patch 0013), so a view transition
+has no layers to take its pictures with; entering compositing mode for one aborted the web
+process (v00.21, YouTube on CPU rendering: startViewTransition -> setActiveViewTransition ->
+enableCompositingMode -> graphicsLayerFactory). document.startViewTransition() skips the
+transition as for a hidden document (the update callback still runs), and no cross-document
+transition is set up (resolveViewTransitionRule says SkipTransition).
+---
+ Source/WebCore/dom/Document.cpp | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/Source/WebCore/dom/Document.cpp b/Source/WebCore/dom/Document.cpp
+index c27d8d47..062e3764 100644
+--- a/Source/WebCore/dom/Document.cpp
++++ b/Source/WebCore/dom/Document.cpp
+@@ -9006,6 +9006,11 @@ Variant<Document::SkipTransition, Vector<AtomString>> Document::resolveViewTrans
+ {
+     if (hidden())
+         return SkipTransition { };
++#if defined(__ORBIS__)
++    // PS4 (Wisp): no compositing (a web process without GL, patch 0013): no layers for the pictures
++    if (!settings().acceleratedCompositingEnabled())
++        return SkipTransition { };
++#endif
+ 
+     RefPtr rule = protect(styleScope().resolver())->viewTransitionRule();
+     if (rule && rule->computedNavigation() == ViewTransitionNavigation::Auto)
+@@ -12267,6 +12272,15 @@ RefPtr<ViewTransition> Document::startViewTransition(StartViewTransitionCallback
+         viewTransition->skipViewTransition(Exception { ExceptionCode::InvalidStateError, "View transition was skipped because document visibility state is hidden."_s });
+         return viewTransition;
+     }
++#if defined(__ORBIS__)
++    // PS4 (Wisp): a page drawn without compositing (a web process without GL draws on the CPU, patch
++    // 0013) has no layers to take a transition's pictures with, and entering compositing mode for one
++    // aborted the web process (v00.21: YouTube on CPU rendering). Skipped as for a hidden document.
++    if (!settings().acceleratedCompositingEnabled()) {
++        viewTransition->skipViewTransition(Exception { ExceptionCode::InvalidStateError, "View transition was skipped because this page is drawn without compositing."_s });
++        return viewTransition;
++    }
++#endif
+ 
+     if (RefPtr activeViewTransition = m_activeViewTransition)
+         activeViewTransition->skipViewTransition(Exception { ExceptionCode::AbortError, "Old view transition aborted by new view transition."_s });
+-- 
+2.53.0
+

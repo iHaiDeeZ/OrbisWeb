@@ -1,0 +1,186 @@
+From d308082e903e62b4de7bda6716e05b9b8aec3f2d Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Thu, 26 Nov 2026 17:42:14 +0300
+Subject: [PATCH] PS4 (Wisp): shared-memory frames read back as BGRA, only what
+ changed
+
+The UI process gets the web process's frames through shared memory. After
+every composite, RenderTargetSHMImage::didRenderFrame read the whole surface
+back with Skia's readPixels (1920x972: 7.5 MB): the renderbuffer is RGBA8 and
+the shared buffer BGRA, so Skia converted every pixel on the CPU
+(SkRasterPipeline, GrConvertPixels' buffers). v00.44's frame counters had the
+compositor at ~21 ms a frame, and Star Fox 64 composited twice for each frame
+its emulator drew, so the page waited on it.
+
+Now GL reads back BGRA itself (Mesa converts on the GPU; the surface's origin
+is top-left, so a rectangle reads back as it is), and only the part of this
+buffer that changed since it was last read back: every frame's change, as the
+platform is told it (no rectangles: all of it), goes into every target's
+record, and a new target reads back all of it. A GL error (no BGRA readback,
+no GL_PACK_ROW_LENGTH) leaves it to Skia for good. WISP_SHM_READBACK=0 keeps
+Skia's way.
+---
+ .../AcceleratedSurface.cpp                    | 81 +++++++++++++++++++
+ .../CoordinatedGraphics/AcceleratedSurface.h  | 12 +++
+ 2 files changed, 93 insertions(+)
+
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+index 689640e5..aaf3d145 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+@@ -51,6 +51,11 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ #include <skia/gpu/ganesh/GrBackendSurface.h>
+ #include <skia/gpu/ganesh/SkSurfaceGanesh.h>
+ #include <skia/gpu/ganesh/gl/GrGLBackendSurface.h>
++#if defined(__ORBIS__)
++#include <cstdlib>
++#include <cstring>
++#include <skia/gpu/ganesh/GrDirectContext.h>
++#endif
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
+ 
+ #if PLATFORM(GTK) || ENABLE(WPE_PLATFORM)
+@@ -146,6 +151,9 @@ AcceleratedSurface::RenderTarget::RenderTarget(AcceleratedSurface& surface, cons
+     , m_surface(surface)
+     , m_size(size)
+ {
++#if defined(__ORBIS__)
++    m_wispReadback = IntRect({ }, size);
++#endif
+ }
+ 
+ AcceleratedSurface::RenderTarget::~RenderTarget() = default;
+@@ -441,6 +449,60 @@ AcceleratedSurface::RenderTargetSHMImage::RenderTargetSHMImage(AcceleratedSurfac
+ 
+ AcceleratedSurface::RenderTargetSHMImage::~RenderTargetSHMImage() = default;
+ 
++#if defined(__ORBIS__)
++#ifndef GL_PACK_ROW_LENGTH
++#define GL_PACK_ROW_LENGTH 0x0D02
++#endif
++#ifndef GL_BGRA_EXT
++#define GL_BGRA_EXT 0x80E1
++#endif
++// PS4 (Wisp): Skia's readPixels() read the whole surface every frame (1920x972: 7.5 MB) as RGBA, its renderbuffer's
++// format, and turned it into BGRA on the CPU (SkRasterPipeline, GrConvertPixels' buffers): the compositor took ~21 ms a
++// frame (v00.44's frame lines), and a game's page waited on it. Here GL reads back BGRA, which Mesa converts on the GPU,
++// and only what changed in this buffer since it was last read back (the platform is told the same rects). A GL error
++// (no BGRA readback, no GL_PACK_ROW_LENGTH) leaves it to Skia for good. WISP_SHM_READBACK=0: Skia's way.
++bool AcceleratedSurface::RenderTargetSHMImage::wispReadBack()
++{
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char* value = getenv("WISP_SHM_READBACK");
++        enabled = !value || strcmp(value, "0");
++    }
++    if (!enabled)
++        return false;
++
++    IntRect rect = std::exchange(m_wispReadback, IntRect());
++    rect.intersect(IntRect({ }, m_bitmap->size()));
++    if (rect.isEmpty())
++        return true;
++
++    auto& display = PlatformDisplay::sharedDisplay();
++    auto* grContext = display.skiaGrContext();
++    if (!grContext) {
++        m_wispReadback = IntRect({ }, m_bitmap->size());
++        return false;
++    }
++    // Skia's drawing reaches GL first (the readback waits for it on the GPU)
++    grContext->flushAndSubmit(GrSyncCpu::kNo);
++    while (glGetError() != GL_NO_ERROR) { }
++    glBindFramebuffer(GL_FRAMEBUFFER, m_fbo);
++    glPixelStorei(GL_PACK_ALIGNMENT, 4);
++    glPixelStorei(GL_PACK_ROW_LENGTH, static_cast<GLint>(m_bitmap->bytesPerRow() / 4));
++    // (the surface's origin is top-left: image row r is GL row r, so a rect reads back as it is)
++    auto* pixels = m_bitmap->mutableSpan().data() + static_cast<size_t>(rect.y()) * m_bitmap->bytesPerRow() + static_cast<size_t>(rect.x()) * 4;
++    glReadPixels(rect.x(), rect.y(), rect.width(), rect.height(), GL_BGRA_EXT, GL_UNSIGNED_BYTE, pixels);
++    const GLenum error = glGetError();
++    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++    grContext->resetContext();
++    if (error == GL_NO_ERROR)
++        return true;
++    enabled = 0;
++    WTFLogAlways("AcceleratedSurface (PS4): GL could not read the frame back as BGRA (0x%x): Skia reads it back from now on", error);
++    return false;
++}
++#endif
++
++
+ void AcceleratedSurface::RenderTargetSHMImage::didRenderFrame()
+ {
+     if (m_surface->useSkia()) {
+@@ -451,6 +513,10 @@ void AcceleratedSurface::RenderTargetSHMImage::didRenderFrame()
+ 
+         if (m_surface->usesGL()) {
+             GLContext::ScopedGLContextCurrent scopedCurrent(*PlatformDisplay::sharedDisplay().skiaGLContext());
++#if defined(__ORBIS__)
++            if (wispReadBack())
++                return;
++#endif
+             m_skiaSurface->readPixels(info, m_bitmap->mutableSpan().data(), m_bitmap->bytesPerRow(), 0, 0);
+         } else
+             m_skiaSurface->readPixels(info, m_bitmap->mutableSpan().data(), m_bitmap->bytesPerRow(), 0, 0);
+@@ -1180,6 +1246,21 @@ void AcceleratedSurface::didRenderFrame(TargetContents targetContents)
+     UNUSED_PARAM(targetContents);
+ #endif
+ 
++#if defined(__ORBIS__) && ENABLE(DAMAGE_TRACKING)
++    // (the change, as the platform is told it: no rects means all of it; RenderTargetSHMImage::wispReadBack)
++    {
++        IntRect change;
++        if (damageRects.isEmpty() || targetContents == TargetContents::Invalid)
++            change = IntRect({ }, m_swapChain.size());
++        else {
++            for (const auto& rect : damageRects)
++                change.unite(rect);
++        }
++        m_swapChain.forEachTarget([&](RenderTarget& target) {
++            target.wispAddReadback(change);
++        });
++    }
++#endif
+     m_target->didRenderFrame();
+     m_pendingFrameNotifyTargets.insert(0, { m_target, WTF::move(damageRects) });
+     m_target = nullptr;
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
+index a48b28f8..989bab67 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
+@@ -199,6 +199,12 @@ private:
+ 
+         SkSurface* skiaSurface() const { return m_skiaSurface.get(); }
+ 
++#if defined(__ORBIS__)
++        // PS4 (Wisp): what changed in this target since it was last read back (a shared-memory target reads
++        // back only that; a new one, all of it): every frame's change goes into every target's record
++        void wispAddReadback(const WebCore::IntRect& rect) { m_wispReadback.unite(rect); }
++#endif
++
+     private:
+ #if ENABLE(DAMAGE_TRACKING)
+         // The damage record is maintained by SwapChainDamageTracker alone, which is what keeps it meaning
+@@ -225,6 +231,9 @@ private:
+         const CheckedRef<AcceleratedSurface> m_surface;
+         WebCore::IntSize m_size;
+         sk_sp<SkSurface> m_skiaSurface;
++#if defined(__ORBIS__)
++        WebCore::IntRect m_wispReadback;
++#endif
+     };
+ 
+ #if PLATFORM(GTK) || ENABLE(WPE_PLATFORM)
+@@ -323,6 +332,9 @@ private:
+     private:
+         bool supportsExplicitSync() const override { return false; }
+         void didRenderFrame() override;
++#if defined(__ORBIS__)
++        bool wispReadBack();
++#endif
+ 
+         const Ref<WebCore::ShareableBitmap> m_bitmap;
+     };
+-- 
+2.53.0
+

@@ -1,0 +1,64 @@
+From 688d403c407baddf247f925e1b26d0639cce3fd3 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Thu, 19 Nov 2026 19:36:16 +0300
+Subject: [PATCH 13/14] PS4 (Wisp): a web process without GL draws on the CPU
+ even when GPU rendering is on; WOFF2 web fonts through FreeType
+
+---
+ .../skia/FontCustomPlatformDataSkia.cpp        |  3 ++-
+ .../DrawingAreaCoordinatedGraphicsGLib.cpp     | 18 ++++++++++++++++++
+ 2 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/Source/WebCore/platform/graphics/skia/FontCustomPlatformDataSkia.cpp b/Source/WebCore/platform/graphics/skia/FontCustomPlatformDataSkia.cpp
+index a4d803d8..8cd526f7 100644
+--- a/Source/WebCore/platform/graphics/skia/FontCustomPlatformDataSkia.cpp
++++ b/Source/WebCore/platform/graphics/skia/FontCustomPlatformDataSkia.cpp
+@@ -136,7 +136,8 @@ bool FontCustomPlatformData::supportsFormat(const String& format)
+ {
+     return equalLettersIgnoringASCIICase(format, "truetype"_s)
+         || equalLettersIgnoringASCIICase(format, "opentype"_s)
+-#if HAVE(WOFF_SUPPORT) || USE(WOFF2)
++#if HAVE(WOFF_SUPPORT) || USE(WOFF2) || defined(__ORBIS__)
++        // PS4 (Wisp): FreeType (built with brotli) reads WOFF2 itself, no woff2 library needed
+         || equalLettersIgnoringASCIICase(format, "woff2"_s)
+ #if ENABLE(VARIATION_FONTS)
+         || equalLettersIgnoringASCIICase(format, "woff2-variations"_s)
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp
+index bc66c74b..e86aa239 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp
+@@ -38,6 +38,10 @@
+ #include "WebPageInlines.h"
+ #include "WebPreferencesKeys.h"
+ #include "WebProcess.h"
++
++#if defined(__ORBIS__)
++#include <WebCore/PlatformDisplay.h>
++#endif
+ #include <WebCore/GraphicsContext.h>
+ #include <WebCore/LocalFrameInlines.h>
+ #include <WebCore/LocalFrameView.h>
+@@ -121,6 +125,20 @@ void DrawingAreaCoordinatedGraphics::updatePreferences(const WebPreferencesStore
+     }
+ #endif
+     settings.setForceCompositingMode(store.getBoolValueForKey(WebPreferencesKey::forceCompositingModeKey()));
++#if defined(__ORBIS__)
++    // PS4 (Wisp): a web process without GL (wisp-web.bin has no Mesa; in wisp-web-gpu.bin Mesa may have
++    // failed) draws its pages on the CPU even when the UI asked for GPU rendering, instead of stopping
++    // at the first composited frame
++    if (!WebCore::PlatformDisplay::sharedDisplayIfExists()) {
++        static bool told;
++        if (!told && settings.acceleratedCompositingEnabled()) {
++            told = true;
++            WTFLogAlways("GPU rendering was asked for, but this web process has no GL: pages are drawn on the CPU.");
++        }
++        settings.setAcceleratedCompositingEnabled(false);
++        settings.setForceCompositingMode(false);
++    }
++#endif
+     // Fixed position elements need to be composited and create stacking contexts
+     // in order to be scrolled by the ScrollingCoordinator.
+     settings.setAcceleratedCompositingForFixedPositionEnabled(settings.acceleratedCompositingEnabled());
+-- 
+2.53.0
+

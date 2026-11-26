@@ -1,0 +1,79 @@
+From 136ae4dd40d7543ecdb2d523bc2f8a0131294971 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Wed, 18 Nov 2026 02:44:17 +0300
+Subject: [PATCH 12/12] PS4 (Wisp): no JIT tiers, two frame buffers, 512 KiB
+ JavaScript thread stacks
+
+The app's three processes share one flexible memory pool for their images, stacks and
+frames, and the web process ran out of it (v00.06): no JIT/DFG/FTL/WebAssembly/sampling
+profiler (9 MiB of each image; the LLInt runs JavaScript, as on Sony's PlayStation
+port), two shared-memory frame buffers per page (the UI copies frames and gives them back
+at once), and JavaScript threads ask for 512 KiB of stack as on PLATFORM(PLAYSTATION).
+---
+ Source/WTF/wtf/Threading.cpp                       |  4 +++-
+ .../CoordinatedGraphics/AcceleratedSurface.h       |  7 +++++++
+ Source/cmake/OptionsWPE.cmake                      | 14 ++++++++++++++
+ 3 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/Source/WTF/wtf/Threading.cpp b/Source/WTF/wtf/Threading.cpp
+index 830f8b7f..c72d22af 100644
+--- a/Source/WTF/wtf/Threading.cpp
++++ b/Source/WTF/wtf/Threading.cpp
+@@ -100,7 +100,9 @@ static std::optional<size_t> NODELETE stackSize(ThreadType threadType)
+     // Return the stack size for the created thread based on its type.
+     // If the stack size is not specified, then use the system default. Platforms can tune the values here.
+     // Enable STACK_STATS in StackStats.h to create a build that will track the information for tuning.
+-#if PLATFORM(PLAYSTATION)
++#if PLATFORM(PLAYSTATION) || defined(__ORBIS__)
++    // (PS4, Wisp too: the other threads take the app's minimum, far below a PC's 8 MiB: stacks come out
++    // of the flexible memory pool the app's processes share)
+     if (threadType == ThreadType::JavaScript)
+         return 512 * KB;
+ #elif OS(DARWIN) && (ASAN_ENABLED || ASSERT_ENABLED)
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
+index e548c04f..1bbcac1d 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
+@@ -407,7 +407,14 @@ private:
+     private:
+         // FIXME: Allow configuring the initial buffer count, e.g. for triple buffering.
+         static constexpr unsigned s_initialBuffers = 2;
++#if defined(__ORBIS__)
++        // PS4 (Wisp): each buffer (a 1920x972 page: 7.5 MiB) is mapped in this process and in the UI,
++        // out of the flexible memory pool the app's processes share; the UI copies a frame and gives
++        // the buffer back at once, so two keep up
++        static constexpr unsigned s_maximumBuffers = 2;
++#else
+         static constexpr unsigned s_maximumBuffers = 4;
++#endif
+ 
+         std::unique_ptr<RenderTarget> createTarget() const;
+ 
+diff --git a/Source/cmake/OptionsWPE.cmake b/Source/cmake/OptionsWPE.cmake
+index 5bd86e4d..38c00482 100644
+--- a/Source/cmake/OptionsWPE.cmake
++++ b/Source/cmake/OptionsWPE.cmake
+@@ -154,6 +154,20 @@ endif ()
+ 
+ WEBKIT_OPTION_DEFAULT_PORT_VALUE(USE_SKIA PRIVATE ON)
+ 
++if (WISP_PS4)
++    # PS4 (Wisp): no JIT tiers, the LLInt runs JavaScript (as on Sony's PlayStation port). Each of the
++    # app's three processes carried 9 MiB of compilers in its image, and images, stacks and frames
++    # all come out of one flexible memory pool the processes share; a JIT's executable memory would
++    # too. WebAssembly and the sampling profiler go with them.
++    WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_JIT PRIVATE OFF)
++    WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_DFG_JIT PRIVATE OFF)
++    WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_FTL_JIT PRIVATE OFF)
++    WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_WEBASSEMBLY PRIVATE OFF)
++    WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_WEBASSEMBLY_BBQJIT PRIVATE OFF)
++    WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_WEBASSEMBLY_OMGJIT PRIVATE OFF)
++    WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_SAMPLING_PROFILER PRIVATE OFF)
++endif ()
++
+ WEBKIT_OPTION_DEPEND(ENABLE_GPU_PROCESS USE_GBM)
+ WEBKIT_OPTION_DEPEND(ENABLE_WPE_PLATFORM_DRM USE_GBM)
+ WEBKIT_OPTION_DEPEND(USE_GBM USE_LIBDRM)
+-- 
+2.53.0
+

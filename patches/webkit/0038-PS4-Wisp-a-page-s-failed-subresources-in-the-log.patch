@@ -1,0 +1,88 @@
+From 45fbb6602c043997b5241bbfca2c5abf9f8c9fae Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Wed, 25 Nov 2026 18:12:37 +0300
+Subject: [PATCH] PS4 (Wisp): a page's failed subresources in the log
+
+A game page said only "Network Error" (EmulatorJS: its ROM or BIOS download got an
+HTTP error or failed), and nothing on the console said which address. On __ORBIS__,
+SubresourceLoader logs (WTFLogAlways, web.log) every subresource answered with HTTP
+400 or more and every load that fails without being cancelled, with its address (240
+characters at most), the first 300 in a process. WISP_LOAD_LOG=0 turns it off.
+---
+ Source/WebCore/loader/SubresourceLoader.cpp | 39 +++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/Source/WebCore/loader/SubresourceLoader.cpp b/Source/WebCore/loader/SubresourceLoader.cpp
+index eb12c538..30bc9233 100644
+--- a/Source/WebCore/loader/SubresourceLoader.cpp
++++ b/Source/WebCore/loader/SubresourceLoader.cpp
+@@ -65,6 +65,12 @@
+ #include <wtf/SystemTracing.h>
+ #include <wtf/text/CString.h>
+ #include <wtf/text/MakeString.h>
++
++#if defined(__ORBIS__)
++#include <atomic>
++#include <stdlib.h>
++#include <string.h>
++#endif
+ #include "LocalFrameInlines.h"
+ 
+ #if PLATFORM(IOS_FAMILY)
+@@ -94,6 +100,30 @@
+ 
+ namespace WebCore {
+ 
++#if defined(__ORBIS__)
++// PS4 (Wisp): a page's failed subresources in web.log, the first 300 in a process (a game said only
++// "Network Error"): HTTP errors (400 and up) and failed loads, with their address. WISP_LOAD_LOG=0
++// (Settings) turns it off.
++static void wispLogFailedSubresource(const URL& url, int httpStatus, const ResourceError* error)
++{
++    static const bool enabled = [] {
++        const char* setting = getenv("WISP_LOAD_LOG");
++        return !setting || strcmp(setting, "0");
++    }();
++    static std::atomic<unsigned> logged { 0 };
++    if (!enabled || logged.fetch_add(1, std::memory_order_relaxed) >= 300)
++        return;
++    String address = url.string();
++    if (address.length() > 240)
++        address = makeString(address.left(240), "..."_s);
++    if (error) {
++        WTFLogAlways("Wisp: a page's load failed: %s (%s %d: %s)", address.utf8().data(), error->domain().utf8().data(),
++            error->errorCode(), error->localizedDescription().utf8().data());
++    } else
++        WTFLogAlways("Wisp: a page's load failed: %s (HTTP %d)", address.utf8().data(), httpStatus);
++}
++#endif
++
+ SubresourceLoader::RequestCountTracker::RequestCountTracker(CachedResourceLoader& cachedResourceLoader, const CachedResource& resource)
+     : m_cachedResourceLoader(&cachedResourceLoader)
+     , m_resource(resource)
+@@ -403,6 +433,10 @@ void SubresourceLoader::didReceiveResponse(ResourceResponse&& response, Completi
+         didFail(badResponseHeadersError(request().url()));
+         return;
+     }
++#if defined(__ORBIS__)
++    if (response.httpStatusCode() >= 400)
++        wispLogFailedSubresource(response.url().isEmpty() ? request().url() : response.url(), response.httpStatusCode(), nullptr);
++#endif
+ 
+ #if USE(QUICK_LOOK)
+     if (shouldCreatePreviewLoaderForResponse(response)) {
+@@ -828,6 +862,11 @@ void SubresourceLoader::didFail(const ResourceError& error)
+     if (m_state != Initialized)
+         return;
+ 
++#if defined(__ORBIS__)
++    if (!error.isCancellation())
++        wispLogFailedSubresource(error.failingURL().isEmpty() ? request().url() : error.failingURL(), 0, &error);
++#endif
++
+     ASSERT(!reachedTerminalState());
+     RefPtr resource = m_resource;
+     LOG(ResourceLoading, "Failed to load '%s'.\n", resource->url().string().latin1().data());
+-- 
+2.53.0
+

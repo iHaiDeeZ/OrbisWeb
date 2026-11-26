@@ -1,0 +1,32 @@
+From 270c5f46281e8faa16d4a920134bda003914fd0e Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Thu, 19 Nov 2026 21:14:24 +0300
+Subject: [PATCH] PS4 (Wisp): a web process without GL also turns hardware
+ acceleration, accelerated drawing, canvas and filters off
+
+---
+ .../DrawingAreaCoordinatedGraphicsGLib.cpp                | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp
+index e86aa239..e06b5c4a 100644
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/DrawingAreaCoordinatedGraphicsGLib.cpp
+@@ -137,6 +137,14 @@ void DrawingAreaCoordinatedGraphics::updatePreferences(const WebPreferencesStore
+         }
+         settings.setAcceleratedCompositingEnabled(false);
+         settings.setForceCompositingMode(false);
++        // and nothing else that needs GL: the page's surface takes shared memory only without
++        // hardware acceleration (AcceleratedSurface::SwapChain asked for the GL display and the
++        // process aborted, v00.11's fallback from GPU to CPU rendering), canvases and filters paint on
++        // the CPU (filters too: Page reads hardwareAccelerationEnabled for them)
++        settings.setHardwareAccelerationEnabled(false);
++        settings.setAcceleratedDrawingEnabled(false);
++        settings.setCanvasUsesAcceleratedDrawing(false);
++        settings.setWebGLEnabled(false);
+     }
+ #endif
+     // Fixed position elements need to be composited and create stacking contexts
+-- 
+2.53.0
+

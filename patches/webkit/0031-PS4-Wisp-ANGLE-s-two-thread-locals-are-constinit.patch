@@ -1,0 +1,76 @@
+From 8709c1f44b8cf03c2b77f676dfaf05a39e6171a9 Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Tue, 24 Nov 2026 19:56:27 +0300
+Subject: [PATCH] PS4 (Wisp): ANGLE's two thread-locals are constinit
+
+gl::gCurrentValidContext and egl::gCurrentThread are declared extern thread_local in ANGLE's headers.
+Other files then read them through a thread wrapper that calls the variable's TLS init function when
+there is one: a weak undefined _ZTH symbol. A static PS4 link leaves it at zero, but create-fself takes
+every undefined symbol for an import from a system module, and refused the web processes ("missing
+module for symbol (_ZTHN2gl20gCurrentValidContextE)"). Both are constant-initialized (nullptr):
+declared constinit, clang reads them directly and refers to no init function.
+---
+ Source/ThirdParty/ANGLE/src/libANGLE/Context.cpp       | 2 +-
+ Source/ThirdParty/ANGLE/src/libANGLE/Context.h         | 4 +++-
+ Source/ThirdParty/ANGLE/src/libGLESv2/global_state.cpp | 2 +-
+ Source/ThirdParty/ANGLE/src/libGLESv2/global_state.h   | 3 ++-
+ 4 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/Source/ThirdParty/ANGLE/src/libANGLE/Context.cpp b/Source/ThirdParty/ANGLE/src/libANGLE/Context.cpp
+index 0ef2adbd..c0017165 100644
+--- a/Source/ThirdParty/ANGLE/src/libANGLE/Context.cpp
++++ b/Source/ThirdParty/ANGLE/src/libANGLE/Context.cpp
+@@ -659,7 +659,7 @@ void SetCurrentValidContextTLS(Context *context)
+     gCurrentValidContext = context;
+ }
+ #else
+-thread_local Context *gCurrentValidContext = nullptr;
++thread_local constinit Context *gCurrentValidContext = nullptr;
+ #endif
+ 
+ // Handle setting the current context in TLS on different platforms
+diff --git a/Source/ThirdParty/ANGLE/src/libANGLE/Context.h b/Source/ThirdParty/ANGLE/src/libANGLE/Context.h
+index b2b9e040..c5f7b8cf 100644
+--- a/Source/ThirdParty/ANGLE/src/libANGLE/Context.h
++++ b/Source/ThirdParty/ANGLE/src/libANGLE/Context.h
+@@ -1209,7 +1209,9 @@ class [[nodiscard]] ScopedContextRef
+ extern Context *GetCurrentValidContextTLS();
+ extern void SetCurrentValidContextTLS(Context *context);
+ #else
+-extern thread_local Context *gCurrentValidContext;
++// (PS4, Wisp: constinit, so that other files read it with no TLS init call: a weak undefined
++// _ZTH symbol, which the PS4 packer takes for a system module import)
++extern thread_local constinit Context *gCurrentValidContext;
+ #endif
+ 
+ extern void SetCurrentValidContext(Context *context);
+diff --git a/Source/ThirdParty/ANGLE/src/libGLESv2/global_state.cpp b/Source/ThirdParty/ANGLE/src/libGLESv2/global_state.cpp
+index a6644a4e..81883f4f 100644
+--- a/Source/ThirdParty/ANGLE/src/libGLESv2/global_state.cpp
++++ b/Source/ThirdParty/ANGLE/src/libGLESv2/global_state.cpp
+@@ -123,7 +123,7 @@ void SetCurrentThreadTLS(Thread *thread)
+     gCurrentThread = thread;
+ }
+ #else
+-thread_local Thread *gCurrentThread = nullptr;
++thread_local constinit Thread *gCurrentThread = nullptr;
+ #endif
+ 
+ gl::Context *GetGlobalLastContext()
+diff --git a/Source/ThirdParty/ANGLE/src/libGLESv2/global_state.h b/Source/ThirdParty/ANGLE/src/libGLESv2/global_state.h
+index 7810ce47..962e7328 100644
+--- a/Source/ThirdParty/ANGLE/src/libGLESv2/global_state.h
++++ b/Source/ThirdParty/ANGLE/src/libGLESv2/global_state.h
+@@ -36,7 +36,8 @@ class Thread;
+ extern Thread *GetCurrentThreadTLS();
+ extern void SetCurrentThreadTLS(Thread *thread);
+ #else
+-extern thread_local Thread *gCurrentThread;
++// (PS4, Wisp: constinit, as gl::gCurrentValidContext)
++extern thread_local constinit Thread *gCurrentThread;
+ #endif
+ 
+ gl::Context *GetGlobalLastContext();
+-- 
+2.53.0
+

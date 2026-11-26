@@ -1,0 +1,127 @@
+From 4fd83d373f0187752bfbd7d4405a4f18dff02a5b Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Sun, 22 Nov 2026 02:04:11 +0300
+Subject: [PATCH] PS4 (Wisp): JavaScriptCore's JIT for the web process: a 64
+ MiB code pool, polling traps, 1 MiB compiler stacks
+
+The web process links a second build with the JIT and DFG tiers (scripts/build-webkit.sh
+WISP_WEBKIT_JIT=1, build/webkit-jit); the UI and network processes keep the build without them.
+Its JavaScript ran on the LLInt alone, and Cloudflare's check took minutes there (v00.24 on .43:
+136 s for a download site, the web main thread stopped 9 s at a time).
+
+OSAllocatorPS4 maps an executable reservation whole through the kit's mmap (system flexible memory
+on the consoles tested, not the pool the app's processes share), so the pool is 64 MiB instead of
+x86-64's 1 GiB of address space. WebKit's C++ sees FreeBSD, whose machine context gives a DFG build
+signal-based VM traps; the kit's crash log owns SIGSEGV and SIGBUS, so JIT code polls for traps.
+The JIT's compiler threads get 1 MiB stacks (the app's minimum is 256 KiB). No FTL, so no B3:
+WebAssembly's AddressType conversions to B3 types (OMG's) are built only with B3, as they already
+were not on Sony's port, the other JIT build without it.
+---
+ Source/JavaScriptCore/jit/ExecutableAllocator.cpp | 6 ++++++
+ Source/JavaScriptCore/runtime/Options.cpp         | 4 +++-
+ Source/JavaScriptCore/wasm/WasmAddressType.cpp    | 4 ++--
+ Source/JavaScriptCore/wasm/WasmAddressType.h      | 2 +-
+ Source/WTF/wtf/Threading.cpp                      | 4 ++++
+ Source/cmake/OptionsWPE.cmake                     | 4 +++-
+ 6 files changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/Source/JavaScriptCore/jit/ExecutableAllocator.cpp b/Source/JavaScriptCore/jit/ExecutableAllocator.cpp
+index c9e3589b..bba3eeab 100644
+--- a/Source/JavaScriptCore/jit/ExecutableAllocator.cpp
++++ b/Source/JavaScriptCore/jit/ExecutableAllocator.cpp
+@@ -103,6 +103,12 @@ static constexpr size_t fixedExecutableMemoryPoolSize = 32 * MB;
+ #else
+ static constexpr size_t fixedExecutableMemoryPoolSize = 16 * MB;
+ #endif
++#elif CPU(X86_64) && defined(__ORBIS__)
++// PS4 (Wisp): WTF's OSAllocatorPS4 maps an executable reservation whole, through the kit's mmap (the
++// kind of executable memory the console allows: system flexible memory on the consoles tested, not the
++// pool the app's processes share), so this is memory taken when the first VM starts. 64 MiB holds a
++// heavy site's Baseline and DFG code; a full pool makes compilations fail, not the page.
++static constexpr size_t fixedExecutableMemoryPoolSize = 64 * MB;
+ #elif CPU(X86_64)
+ static constexpr size_t fixedExecutableMemoryPoolSize = 1 * GB;
+ #else
+diff --git a/Source/JavaScriptCore/runtime/Options.cpp b/Source/JavaScriptCore/runtime/Options.cpp
+index 683bc60a..0cf27645 100644
+--- a/Source/JavaScriptCore/runtime/Options.cpp
++++ b/Source/JavaScriptCore/runtime/Options.cpp
+@@ -650,7 +650,9 @@ static void overrideDefaults()
+     Options::mediumHeapRAMFraction() = 0.9;
+ #endif
+ 
+-#if !ENABLE(SIGNAL_BASED_VM_TRAPS)
++#if !ENABLE(SIGNAL_BASED_VM_TRAPS) || defined(__ORBIS__)
++    // (PS4, Wisp: WebKit's C++ sees FreeBSD there, which has signal-based traps, but the kit's crash log
++    // owns SIGSEGV and SIGBUS: JIT code polls for traps instead)
+     Options::usePollingTraps() = true;
+ #endif
+ 
+diff --git a/Source/JavaScriptCore/wasm/WasmAddressType.cpp b/Source/JavaScriptCore/wasm/WasmAddressType.cpp
+index 64a431f9..8d060385 100644
+--- a/Source/JavaScriptCore/wasm/WasmAddressType.cpp
++++ b/Source/JavaScriptCore/wasm/WasmAddressType.cpp
+@@ -52,7 +52,7 @@ AddressType::AddressType(TypeKind typeKind)
+     }
+ }
+ 
+-#if !PLATFORM(PLAYSTATION) && ENABLE(JIT)
++#if !PLATFORM(PLAYSTATION) && ENABLE(B3_JIT)
+ AddressType::AddressType(B3::Type type)
+ {
+     switch (type.kind()) {
+@@ -92,7 +92,7 @@ Wasm::Type AddressType::asWasmType() const
+     RELEASE_ASSERT_NOT_REACHED(invalidAddressTypeConversion);
+ }
+ 
+-#if !PLATFORM(PLAYSTATION) && ENABLE(JIT)
++#if !PLATFORM(PLAYSTATION) && ENABLE(B3_JIT)
+ B3::TypeKind AddressType::asB3TypeKind() const
+ {
+     switch (m_type) {
+diff --git a/Source/JavaScriptCore/wasm/WasmAddressType.h b/Source/JavaScriptCore/wasm/WasmAddressType.h
+index 22e7df3a..04c12f9e 100644
+--- a/Source/JavaScriptCore/wasm/WasmAddressType.h
++++ b/Source/JavaScriptCore/wasm/WasmAddressType.h
+@@ -46,7 +46,7 @@ public:
+     AddressType() = default;
+     AddressType(TypeKind);
+     AddressType(AddressType::Kind);
+-#if !PLATFORM(PLAYSTATION) && ENABLE(JIT)
++#if !PLATFORM(PLAYSTATION) && ENABLE(B3_JIT)
+     AddressType(B3::Type);
+ #endif
+     explicit AddressType(bool is64bit);
+diff --git a/Source/WTF/wtf/Threading.cpp b/Source/WTF/wtf/Threading.cpp
+index 86a3c727..f9fbdf17 100644
+--- a/Source/WTF/wtf/Threading.cpp
++++ b/Source/WTF/wtf/Threading.cpp
+@@ -110,6 +110,10 @@ static std::optional<size_t> NODELETE stackSize(ThreadType threadType)
+     // them (GLSL); the app's minimum (256 KiB) serves the rest
+     if (threadType == ThreadType::Graphics)
+         return 1 * MB;
++    // the JIT's compiler threads (the web process's DFG and Baseline, v00.27): Darwin gives them 512 KiB
++    // and more, the app's minimum is 256 KiB; stacks come from each process's heap (direct memory)
++    if (threadType == ThreadType::Compiler)
++        return 1 * MB;
+ #endif
+ #elif OS(DARWIN) && (ASAN_ENABLED || ASSERT_ENABLED)
+     if (threadType == ThreadType::Compiler)
+diff --git a/Source/cmake/OptionsWPE.cmake b/Source/cmake/OptionsWPE.cmake
+index 38c00482..9811a33a 100644
+--- a/Source/cmake/OptionsWPE.cmake
++++ b/Source/cmake/OptionsWPE.cmake
+@@ -158,7 +158,9 @@ if (WISP_PS4)
+     # PS4 (Wisp): no JIT tiers, the LLInt runs JavaScript (as on Sony's PlayStation port). Each of the
+     # app's three processes carried 9 MiB of compilers in its image, and images, stacks and frames
+     # all come out of one flexible memory pool the processes share; a JIT's executable memory would
+-    # too. WebAssembly and the sampling profiler go with them.
++    # too. WebAssembly and the sampling profiler go with them. (v00.27: the web process links a second
++    # build with the JIT and the DFG, scripts/build-webkit.sh WISP_WEBKIT_JIT=1: build/webkit-jit; its
++    # code memory is the kit's executable memory, not that pool. The UI and network processes keep this.)
+     WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_JIT PRIVATE OFF)
+     WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_DFG_JIT PRIVATE OFF)
+     WEBKIT_OPTION_DEFAULT_PORT_VALUE(ENABLE_FTL_JIT PRIVATE OFF)
+-- 
+2.53.0
+

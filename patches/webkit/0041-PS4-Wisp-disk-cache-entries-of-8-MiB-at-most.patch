@@ -1,0 +1,39 @@
+From 3ccfdf81e292a0da26e5ddac54c89c398d8bef1d Mon Sep 17 00:00:00 2001
+From: wisp <wisp@localhost>
+Date: Wed, 25 Nov 2026 21:09:40 +0300
+Subject: [PATCH] PS4 (Wisp): disk cache entries of 8 MiB at most
+
+NetworkResourceLoader buffers a response for the disk cache up to an eighth of the
+cache's capacity, then the cache copies it whole into one buffer. The PS4 network
+process has a 128 MiB heap: a game's 52 MB file was held, then malloc(52634847)
+failed while the game held the direct memory a larger heap would need, and the
+process ended (CRASH in allocateBuffer), taking the page's loads, WebSockets and
+storage with it. On __ORBIS__ a response is buffered for the cache up to 8 MiB;
+larger ones are not kept in the disk cache.
+---
+ Source/WebKit/NetworkProcess/NetworkResourceLoader.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/Source/WebKit/NetworkProcess/NetworkResourceLoader.cpp b/Source/WebKit/NetworkProcess/NetworkResourceLoader.cpp
+index 2075c77b..6c31133b 100644
+--- a/Source/WebKit/NetworkProcess/NetworkResourceLoader.cpp
++++ b/Source/WebKit/NetworkProcess/NetworkResourceLoader.cpp
+@@ -1173,7 +1173,15 @@ void NetworkResourceLoader::didReceiveBuffer(const WebCore::FragmentedSharedBuff
+ 
+     if (m_bufferedDataForCache) {
+         // Prevent memory growth in case of streaming data and limit size of entries in the cache.
++#if defined(__ORBIS__)
++        // PS4 (Wisp): 8 MiB at most. The network process has a 128 MiB heap, and an eighth of the cache
++        // let a game's 52 MB file be held whole, then copied whole for the cache, while the game held the
++        // direct memory a bigger heap would need: malloc failed and the process ended (v00.40, Midnight
++        // Club 3's disc). Larger responses are not kept in the disk cache.
++        const size_t maximumCacheBufferSize = std::min<size_t>(m_cache->capacity() / 8, static_cast<size_t>(8) << 20);
++#else
+         const size_t maximumCacheBufferSize = m_cache->capacity() / 8;
++#endif
+         if (m_bufferedDataForCache.size() + buffer.size() <= maximumCacheBufferSize)
+             m_bufferedDataForCache.append(buffer);
+         else
+-- 
+2.53.0
+
